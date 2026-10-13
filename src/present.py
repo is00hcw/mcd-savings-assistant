@@ -117,7 +117,8 @@ def render_inline(p: dict) -> str:
     if p["actions"]:
         out.append("")
         for a in p["actions"]:
-            out.append(f"[{a.get('label')}]" + (f" `{a.get('command')}`" if a.get("command") else ""))
+            # command 是给 Agent 执行的指令，不展示给终端用户（太长、暴露路径、含 --yes 凭据）
+            out.append(f"[{a.get('label')}]")
 
     if p["meta"].get("hint"):
         out.append("")

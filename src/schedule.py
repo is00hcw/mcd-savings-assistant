@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .config import CACHE_DIR
-from . import payloads, present, persona
+from . import payloads, present
 
 SCHEDULE_FILE = CACHE_DIR / "schedules.json"
 OUTBOX_DIR = CACHE_DIR / "outbox"
@@ -65,6 +65,7 @@ def add(kind: str = KIND_ORDER, at: str = "", store: str = "", items: str = "",
         "store": store, "items": items, "track": track, "coupon": coupon,
         "note": note, "repeatDays": days,
         "status": "pending", "createdAt": _now(), "firedAt": None,
+        "fireCount": 0, "lastFiredDate": None,
     }
     items_all = _load()
     items_all.append(sch)
@@ -121,38 +122,84 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _today_str(now: datetime) -> str:
+    return now.strftime("%Y-%m-%d")
+
+
+def _day_of(created_at: str | None) -> "datetime.date":
+    """从 createdAt 字符串取日期（用于重复任务的起始日）。"""
+    try:
+        return datetime.strptime(str(created_at or "")[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return datetime.now().date()
+
+
 def due(schedules: list[dict] | None = None, now: datetime | None = None) -> list[dict]:
-    """返回当前已到点、待触发的任务（含重复窗口）。"""
+    """返回当前已到点、待触发的任务（含重复窗口）。
+
+    判定规则：
+      · 指定日期（date）：到点一次性触发。
+      · 连续 repeatDays 天：从登记当天（第 1 天）起，每天到点触发一次，
+        当天去重（lastFiredDate），触发满 repeatDays 次后不再出现。
+      · 仅一次（repeatDays=0）：今天到点且尚未触发过。
+    """
     now = now or datetime.now()
     out = []
     for s in (schedules if schedules is not None else list_all()):
         if s.get("status") != "pending":
             continue
         t = s.get("time") or "00:00:00"
-        target = now.replace(hour=int(t[0:2]), minute=int(t[3:5]), second=int(t[6:8] or 0),
-                             microsecond=0)
-        if s.get("date"):  # 指定日期
+        hh, mm = int(t[0:2]), int(t[3:5])
+        ss = int(t[6:8] or 0)
+
+        if s.get("date"):  # 指定日期：一次性
             d = datetime.strptime(s["date"], "%Y-%m-%d")
-            target = target.replace(year=d.year, month=d.month, day=d.day)
-        if now >= target:
+            target = d.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+            if now >= target:
+                out.append(s)
+            continue
+
+        today_target = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+        if now < today_target:
+            continue  # 今天还没到点
+
+        rd = int(s.get("repeatDays") or 0)
+        if rd > 0:
+            start = _day_of(s.get("createdAt"))
+            day_index = (now.date() - start).days + 1
+            if day_index > rd:
+                continue  # 已超出连续天数
+            if s.get("lastFiredDate") == _today_str(now):
+                continue  # 今天已触发过，去重
             out.append(s)
+        else:
+            if int(s.get("fireCount") or 0) == 0:
+                out.append(s)
     return out
 
 
 def next_trigger(s: dict, now: datetime | None = None) -> str:
-    """人类可读的「下次触发」描述。"""
+    """人类可读的「下次触发」描述（与 due() 的判定口径保持一致）。"""
     now = now or datetime.now()
     t = s.get("time") or "00:00:00"
-    hh, mm, ss = int(t[0:2]), int(t[3:5]), int(t[6:8] or 0)
+    hh, mm = int(t[0:2]), int(t[3:5])
+    ss = int(t[6:8] or 0)
     if s.get("date"):
         d = datetime.strptime(s["date"], "%Y-%m-%d")
-        return f"{d.strftime('%m-%d')} {hh:02d}:{mm:02d}"
-    if s.get("repeatDays"):
-        return f"每天 {hh:02d}:{mm:02d}（连续 {s['repeatDays']} 天）"
+        target = d.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+        if now < target:
+            return f"{d:%m-%d} {hh:02d}:{mm:02d}"
+        return "已到点，待触发" if s.get("status") == "pending" else "已触发"
+    rd = int(s.get("repeatDays") or 0)
+    if rd > 0:
+        n = int(s.get("fireCount") or 0)
+        return f"每天 {hh:02d}:{mm:02d}（连续 {rd} 天，已触发 {n}/{rd}）"
     today = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
     if today > now:
         return f"今天 {hh:02d}:{mm:02d}"
-    return f"明天 {hh:02d}:{mm:02d}（未触发）"
+    if s.get("status") == "pending":
+        return f"已到点，待触发（{hh:02d}:{mm:02d}）"
+    return f"{hh:02d}:{mm:02d}（已触发）"
 
 
 # ---------------------------------------------------------------------------
@@ -226,28 +273,9 @@ def fire(client, sch: dict) -> dict:
     draft["confirmedByHuman"] = False         # 显式标记：尚未获用户确认
     draft_path = order_exec.save_draft(draft)
 
+    # 标题 / 话术 / 红线声明统一由 confirm_from_draft 依据 scheduledFrom 生成，
+    # 这里不再手工拼 summary/hint（避免两处文案漂移）。
     p = payloads.confirm_from_draft(draft, str(draft_path))
-    p["title"] = f'到点了：{sch.get("note") or "该下单了"}'
-    coupon = draft.get("coupon") or {}
-    coupon_txt = ""
-    if coupon:
-        exp = coupon.get("expireAt") or ""
-        coupon_txt = f'用券「{coupon.get("name") or coupon.get("couponCode")}」' \
-                     + (f'（有效期至 {exp}）' if exp else '')
-    p["summary"] = (
-        f'{persona.nick()}，{sch.get("at")} 的单我按此刻的价格重新算好了：'
-        f'原价 {draft.get("originalPrice")}，到手 {draft.get("price")}'
-        + (f'，省 {draft.get("discount")}' if float(draft.get("discount") or 0) > 0 else "")
-        + (f'，{coupon_txt}' if coupon_txt else "，这单没券可用")
-        + '。你确认我就下，不确认我不动。')
-    # 追加（不覆盖）确认卡里已有的门店/券/取餐信息
-    store_line = (draft.get("storeName") or draft.get("storeCode") or "")
-    if draft.get("takeWayName"):
-        store_line += f'（{draft["takeWayName"]}）'
-    p["meta"]["hint"] = (
-        f'到点任务 {sch["id"]}｜{sch.get("note") or "无备注"}｜{store_line}｜'
-        f'券：{coupon_txt or "无可用券"}｜'
-        f'⛔ 这条只是确认消息，我不会自动下单。')
     r = _emit(sch, p, draft_path)
     r["readOnlyCalls"] = client.calls
     return r
@@ -280,10 +308,14 @@ def _emit(sch: dict, payload: dict, draft_path) -> dict:
     items = _load()
     for s in items:
         if s.get("id") == sch["id"]:
-            s["status"] = "fired"
+            s["fireCount"] = int(s.get("fireCount") or 0) + 1
+            s["lastFiredDate"] = datetime.now().strftime("%Y-%m-%d")
             s["firedAt"] = _now()
             s["outbox"] = {"json": str(json_path), "html": str(html_path),
                            "draft": str(draft_path) if draft_path else None}
+            rd = int(s.get("repeatDays") or 0)
+            # 还有剩余天数 → 保持 pending 等下一次；否则置 fired 收尾
+            s["status"] = "pending" if (rd > 0 and s["fireCount"] < rd) else "fired"
     _save(items)
     return {"id": sch["id"], "payload": payload, "json": str(json_path),
             "html": str(html_path), "draft": str(draft_path) if draft_path else None}

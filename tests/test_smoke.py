@@ -362,6 +362,41 @@ def test_schedule():
         assert sch.cancel(s["id"]) and sch.list_all()[0]["status"] == "cancelled"
 
 
+def test_repeat_schedule():
+    """repeatDays：连续 N 天每天触发一次；触发满 N 次后置 fired；当天去重。"""
+    from src import schedule as sch
+    from src.mcd_client import McdClient
+    from datetime import datetime
+    import tempfile as _tf
+
+    # ① due 的重复窗口 + 按天去重（纯逻辑，注入 now）
+    base = {
+        "id": "sch-r", "kind": "alert", "at": "08:00", "time": "08:00:00",
+        "date": None, "store": "", "items": "", "track": "global",
+        "coupon": "auto", "note": "早餐", "repeatDays": 3,
+        "status": "pending", "createdAt": "2026-10-13 07:00:00",
+        "firedAt": None, "fireCount": 0, "lastFiredDate": None,
+    }
+    assert len(sch.due(schedules=[base], now=datetime(2026, 10, 13, 8, 1))) == 1  # 第1天
+    assert sch.due(schedules=[base], now=datetime(2026, 10, 13, 7, 59)) == []     # 未到点
+    fired1 = dict(base); fired1["fireCount"] = 1; fired1["lastFiredDate"] = "2026-10-13"
+    assert sch.due(schedules=[fired1], now=datetime(2026, 10, 13, 9, 0)) == []     # 当天去重
+    assert len(sch.due(schedules=[fired1], now=datetime(2026, 10, 14, 8, 1))) == 1  # 第2天
+    assert len(sch.due(schedules=[fired1], now=datetime(2026, 10, 15, 8, 1))) == 1  # 第3天
+    assert sch.due(schedules=[fired1], now=datetime(2026, 10, 16, 8, 1)) == []      # 第4天超窗口
+
+    # ② _emit 状态流转：repeatDays=2 触发两次后置 fired
+    with _tf.TemporaryDirectory() as td:
+        tmp = Path(td)
+        sch.SCHEDULE_FILE = tmp / "schedules.json"
+        sch.OUTBOX_DIR = tmp / "outbox"
+        s = sch.add(kind="alert", at="09:00", note="两次", days=2)
+        sch.fire(sch._NoMoneyClient(McdClient("x")), s)
+        assert sch.list_all()[0]["status"] == "pending" and sch.list_all()[0]["fireCount"] == 1
+        sch.fire(sch._NoMoneyClient(McdClient("x")), s)
+        assert sch.list_all()[0]["status"] == "fired" and sch.list_all()[0]["fireCount"] == 2
+
+
 def test_fuzzy_prefers_bought():
     """模糊匹配优先命中买过的商品（用户只说简称时的正确预期）。"""
     from src import optimize, price_memory
@@ -433,6 +468,34 @@ def test_message_format():
     assert "薯条 × 2" in at and "需你确认" in at and "11:30" in at
 
 
+def test_confirm_format_edge():
+    """省 0 元不显示「省」；inline 卡片不把 command 贴给用户。"""
+    from src import payloads, present
+
+    # 省 0：metrics 不含「省」指标，summary 不提「省 0」
+    p0 = payloads.confirm_from_draft({
+        "storeCode": "1421252", "storeName": "测试店", "takeWayName": "堂食",
+        "items": [{"productCode": "4810", "name": "薯条", "quantity": 2, "subtotal": 29.0}],
+        "coupon": None, "price": 29.0, "originalPrice": 29.0, "discount": 0.0,
+    }, "d.json")
+    assert p0["type"] == "confirm"
+    assert "省" not in [m["label"] for m in p0["metrics"]]
+    assert "省" not in p0["summary"]
+
+    # 省 > 0：仍显示「省」
+    p1 = payloads.confirm_from_draft({
+        "storeCode": "1421252", "storeName": "测试店",
+        "items": [{"productCode": "4810", "name": "薯条", "quantity": 2}],
+        "coupon": None, "price": 25.0, "originalPrice": 29.0, "discount": 4.0,
+    }, "d.json")
+    assert "省" in [m["label"] for m in p1["metrics"]]
+
+    # inline 渲染不把 command 贴给用户（那是给 Agent 执行的指令）
+    txt = present.render_inline(p1)
+    assert "python main.py order" not in txt
+    assert "[确认下单]" in txt and "[再想想]" in txt
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -448,8 +511,10 @@ def main():
         test_onboarding()
         test_phrases()
         test_schedule()
+        test_repeat_schedule()
         test_fuzzy_prefers_bought()
         test_message_format()
+        test_confirm_format_edge()
     print("ALL OFFLINE TESTS PASSED ✅")
 
 

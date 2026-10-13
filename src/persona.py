@@ -43,14 +43,42 @@ def on_savings_report(saved: float, drops: int, period: str = "这周") -> str:
 
 
 def confirm_gate(draft: dict) -> str:
-    """下单前确认话术（红线：只确认，不代点）。"""
+    """下单前确认话术（红线：只确认，不代点）。
+
+    省 0 元时不硬塞「省 0」，避免尴尬。
+    """
     coupon = draft.get("coupon")
-    coupon_txt = f"用「{coupon.get('name') or coupon.get('couponCode')}」" if coupon else "未用券"
-    return (
-        f"{nick()}，这单我算好了：原价 {draft.get('originalPrice', 0):g}，"
-        f"{coupon_txt}后 {draft.get('price', 0):g}，省 {draft.get('discount', 0):g}。"
-        f"你确认我就下，不确认我不动。"
-    )
+    orig = draft.get("originalPrice", 0)
+    price = draft.get("price", 0)
+    discount = float(draft.get("discount") or 0)
+    if coupon:
+        body = f"原价 {orig:g}，用「{coupon.get('name') or coupon.get('couponCode')}」后 {price:g}"
+    else:
+        body = f"原价 {orig:g}，到手 {price:g}"
+    if discount > 0:
+        body += f"，省 {discount:g}"
+    return f"{nick()}，这单我算好了：{body}。你确认我就下，不确认我不动。"
+
+
+def confirm_gate_scheduled(draft: dict) -> str:
+    """到点确认话术：强调「按此刻重新算价」（券可能过期、价可能变了）。"""
+    sched = draft.get("scheduledFrom") or {}
+    at = sched.get("at") or "到点"
+    coupon = draft.get("coupon")
+    orig = draft.get("originalPrice", 0)
+    price = draft.get("price", 0)
+    discount = float(draft.get("discount") or 0)
+    if coupon:
+        coupon_txt = f'用券「{coupon.get("name") or coupon.get("couponCode")}」'
+        if coupon.get("expireAt"):
+            coupon_txt += f'（有效期至 {coupon["expireAt"]}）'
+    else:
+        coupon_txt = "这单没券可用"
+    parts = [f"原价 {orig:g}", f"到手 {price:g}"]
+    if discount > 0:
+        parts.append(f"省 {discount:g}")
+    return (f"{nick()}，{at} 的单我按此刻的价格重新算好了："
+            + "，".join(parts) + f"，{coupon_txt}。你确认我就下，不确认我不动。")
 
 
 def blocked_by_gate() -> str:

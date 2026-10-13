@@ -133,16 +133,34 @@ def confirm_from_draft(draft: dict, draft_path: str = "") -> dict:
     metrics = [
         {"label": "原价", "value": draft.get("originalPrice"), "unit": "元"},
         {"label": "到手价", "value": draft.get("price"), "unit": "元", "emphasis": True},
-        {"label": "省", "value": saved, "unit": "元", "emphasis": True},
     ]
+    if saved > 0:
+        metrics.append({"label": "省", "value": saved, "unit": "元", "emphasis": True})
+
     sched = draft.get("scheduledFrom")
     if sched:
         metrics.insert(0, {"label": "到点时间", "value": sched.get("at") or "到点即取",
                            "unit": "", "emphasis": True})
 
+    # 到点场景与普通算价场景共用本函数：标题 / 话术 / 红线声明在此统一生成，
+    # 避免 schedule.fire 再手工拼一份（文案漂移风险）。
+    if sched:
+        title = f'到点了：{sched.get("note") or "该下单了"}'
+        summary = persona.confirm_gate_scheduled(draft)
+        hint_parts = [f'到点任务 {sched.get("id") or ""}']
+        if sched.get("note"):
+            hint_parts.append(str(sched["note"]))
+        hint_parts.append(store_line)
+        hint_parts.append(f'券：{coupon_txt}')
+        hint_parts.append("⛔ 这条只是确认消息，我不会自动下单。")
+    else:
+        title = "下单确认"
+        summary = persona.confirm_gate(draft)
+        hint_parts = [store_line, f'券：{coupon_txt}',
+                      "未收到你的明确确认前，我不会调用 create-order。"]
+
     return present.make_payload(
-        "confirm", "下单确认",
-        persona.confirm_gate(draft),
+        "confirm", title, summary,
         metrics=metrics,
         items=items,
         actions=[
@@ -152,9 +170,7 @@ def confirm_from_draft(draft: dict, draft_path: str = "") -> dict:
         ],
         draft=draft,
         meta={
-            "hint": f'{store_line}｜券：{coupon_txt}'
-                    + ("；到点任务已重新算价" if sched else "")
-                    + "。未收到你的明确确认前，我不会调用 create-order。",
+            "hint": "｜".join(hint_parts),
             "trace": draft.get("savingDetail", ""),
         },
     )
