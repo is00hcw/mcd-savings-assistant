@@ -1,24 +1,42 @@
 # -*- coding: utf-8 -*-
-"""D · 最优下单决策（双轨推荐 + OrderDraft）
+"""D · 最优下单决策（单轨 global/top3 + 双轨候选 dual + OrderDraft）
 
 硬约束（实测）：积分券每单限 1 张且不叠加 → 枚举退化为"线性挑一张"。
 金额单位：calculate-price 返回=分。
-takeWayCode 只能来自 calculate-price 的 takeWayList。
+takeWayCode 只能来自 calculate-price 的 takeWayList（到店 orderType=1 才有）。
+
+取餐范围：
+  · 到店自提（默认）：beType=1 / orderType=1，takeWayCode 从 takeWayList 取；
+  · 麦乐送外卖：beType=2 / orderType=2，必传 beCode（delivery-query-stores 返回），
+    无 takeWayList、不传 takeWayCode，价格含配送费(deliveryPrice)+打包费(packingPrice)。
+
+轨道选择：
+  · --track global / top3：单轨直出一条候选；
+  · --track dual（双轨候选二选一）：optimize_dual 同时算两条，confirm_candidates
+    出双候选确认卡，用户选定一条后再走单卡确认闸。
+
+reservationDate：本工具产出的都是**即时单**（定时任务=到点重算价+提醒+人工确认，
+不做预约单），故恒为 None；字段保留以兼容 create-order 的预约能力与确认闸摘要。
 """
 import json
 import time
 
 from .normalize import normalize_name
+from .mcd_client import McpError, NetworkError
 from . import price_memory
 
 
-def build_items(client, store_code: str, wanted: list[tuple[str, int]]) -> list[dict]:
+def build_items(client, store_code: str, wanted: list[tuple[str, int]],
+                be_type: int = 1, order_type: int = 1,
+                be_code: str | None = None) -> list[dict]:
     """把 [(商品名或code, 数量)] 解析为 calculate-price 的 items。
 
     商品名会先在该店菜单内按归一化 name 查 code（code 是门店内下单凭证）。
     同时把商品名回填进 items（供确认卡/战报卡展示，calculate-price 忽略多余字段）。
+    be_type/order_type/be_code：外卖(2/2)场景查菜单必传，否则 query-meals 报错。
     """
-    menu = _menu_index(client, store_code)
+    menu = _menu_index(client, store_code, be_type=be_type, order_type=order_type,
+                       be_code=be_code)
     menu_codes = {k: str(m.get("code")) for k, m in menu.items() if m.get("code")}
     items = []
     for name_or_code, qty in wanted:
@@ -73,24 +91,30 @@ def _fuzzy_menu_key(key: str, menu: dict[str, dict],
     return ordered[0], ordered
 
 
-def _menu_index(client, store_code: str) -> dict[str, dict]:
-    meals_raw = client.meals(store_code)
+def _menu_index(client, store_code: str, be_type: int = 1, order_type: int = 1,
+                be_code: str | None = None) -> dict[str, dict]:
+    meals_raw = client.meals(store_code, order_type=order_type, be_type=be_type,
+                             be_code=be_code)
     md = meals_raw.get("data") if isinstance(meals_raw, dict) else meals_raw
     from .normalize import meal_index_from_query_meals
     return meal_index_from_query_meals(md if isinstance(md, dict) else {})
 
 
-def _coupon_candidates(client, store_code: str) -> tuple[list[dict], list[str]]:
+def _coupon_candidates(client, store_code: str, be_type: int = 1,
+                       order_type: int = 1, be_code: str | None = None) -> tuple[list[dict], list[str]]:
     """合并卡包券 + 门店可用券，去重。
 
     返回 (券列表, 警告列表)。某一路查询失败不再静默吞掉，
     而是记入 warnings 让确认卡标注「结果可能不完整」。
+    门店券 query-store-coupons 必传 orderType/beType（外送再传 beCode）。
     实测结构：query-my-coupons → data.coupons[]（id/code/title…）。
     """
     coupons: dict[str, dict] = {}
     warnings: list[str] = []
     for label, fetch in (("卡包券", lambda: client.my_coupons()),
-                         ("门店券", lambda: client.store_coupons(store_code))):
+                         ("门店券", lambda: client.store_coupons(
+                             store_code, order_type=order_type, be_type=be_type,
+                             be_code=be_code))):
         try:
             raw = fetch()
         except Exception as e:
@@ -113,14 +137,19 @@ def _coupon_candidates(client, store_code: str) -> tuple[list[dict], list[str]]:
 
 
 def calc_price(client, store_code: str, items: list[dict], coupon: dict | None = None,
-               be_type: int = 1, order_type: int = 1) -> dict:
+               be_type: int = 1, order_type: int = 1, be_code: str | None = None) -> dict:
     """调 calculate-price。返回原始结果（金额=分，实测）。
 
     实测必带参数：beType(1-到店取餐/2-麦乐送/5-得来速/6-团餐)、
     orderType(1-到店/2-外送)、beCode("1" 可用)；takeWayList[].code 如 eat-in/locker-in。
+    外卖(beType=2) 必传 beCode，且结果无 takeWayList。
     """
     args = {"storeCode": store_code, "items": items,
-            "beType": be_type, "orderType": order_type, "beCode": "1"}
+            "beType": be_type, "orderType": order_type}
+    if be_type == 1:
+        args["beCode"] = "1"
+    elif be_code:
+        args["beCode"] = be_code
     if coupon:
         item0 = dict(items[0])
         item0["couponId"] = coupon.get("id") or coupon.get("couponId")
@@ -130,33 +159,114 @@ def calc_price(client, store_code: str, items: list[dict], coupon: dict | None =
 
 
 def optimize(client, store_code: str, wanted: list[tuple[str, int]],
-             track: str = "global") -> dict:
+             track: str = "global", delivery: dict | None = None,
+             coupon: str = "auto") -> dict:
     """产出最优 OrderDraft。
 
     track=global: 对给定商品组合枚举券挑最低价。
     track=top3  : 先取购买量 Top3 商品里当前可买的，再同样算最低价。
+    delivery    : None=到店自提；dict={"addressId","beCode","addressText"} 外卖。
+    coupon      : "auto"（默认，枚举所有候选券取最低价）；或具体券 id/code——
+                  只测「无券基线 + 该券」两条，不再全量枚举；该券不可用时
+                  记入 pricingWarnings 并注明其生效时间窗，退回无券价。
     """
+    be_type = 2 if delivery else 1
+    order_type = 2 if delivery else 1
+    be_code = (delivery or {}).get("beCode")
+
     if track == "top3":
         tops = price_memory.top_products(3)
-        menu = _menu_index(client, store_code)
+        menu = _menu_index(client, store_code, be_type=be_type, order_type=order_type,
+                           be_code=be_code)
         wanted = [(k, 1) for k, _ in tops if k in menu]
         if not wanted:
             raise ValueError("Top3 常买商品在该店菜单中均不可买，改用 --track global")
 
-    items = build_items(client, store_code, wanted)
+    items = build_items(client, store_code, wanted, be_type=be_type, order_type=order_type,
+                        be_code=be_code)
+    return _best_quote(client, store_code, items, be_type=be_type,
+                       order_type=order_type, be_code=be_code,
+                       coupon=coupon, track=track)
 
+
+def _match_coupon(coupons: list[dict], key: str) -> dict | None:
+    """按券 id / code 匹配指定券（大小写不敏感）。"""
+    k = str(key).strip()
+    if not k:
+        return None
+    kl = k.lower()
+    for c in coupons:
+        for field in ("id", "couponId", "code", "couponCode"):
+            v = c.get(field)
+            if v is not None and str(v).strip().lower() == kl:
+                return c
+    return None
+
+
+def _coupon_validity_text(c: dict) -> str:
+    """人类可读的券生效时间窗（字段名多源兜底，拿不到就明说未知）。"""
+    start = (c.get("tradeStartDateTime") or c.get("tradeStartDate")
+             or c.get("validFrom") or c.get("startDate") or "")
+    end = (c.get("tradeEndDateTime") or c.get("tradeEndDate")
+           or c.get("validTo") or c.get("endDate") or "")
+    start, end = str(start)[:16], str(end)[:16]
+    if start and end:
+        return f"生效 {start} ~ {end}"
+    if start:
+        return f"{start} 起生效"
+    if end:
+        return f"有效期至 {end}"
+    return "生效时间未知（以券面为准）"
+
+
+def _best_quote(client, store_code: str, items: list[dict],
+                be_type: int = 1, order_type: int = 1, be_code: str | None = None,
+                coupon: str = "auto", track: str = "global") -> dict:
+    """对给定 items 枚举券取最优价并生成草稿（optimize / reprice_draft 共用）。
+
+    coupon 语义见 optimize()。指定券时算价失败不再静默：把失败原因（含券的
+    生效时间窗）写进 warnings，让确认卡明示「指定券为何没生效」，退回无券价。
+    """
     # ① 无券基线（必要查询：失败/无金额必须报错，绝不产出误导草稿）
-    base = calc_price(client, store_code, items)
+    base = calc_price(client, store_code, items,
+                      be_type=be_type, order_type=order_type, be_code=be_code)
     best = {"coupon": None, "result": base}
     best_price = _price_of(base)
 
     # ② 线性枚举每张券各算一次（积分券限一张不叠加，无需组合）
-    coupons, warnings = _coupon_candidates(client, store_code)
-    for c in coupons:
+    #    业务错误（如「当前优惠券不可用」「促销规则不支持该商品」）是正常的券过滤，
+    #    静默跳过；网络错误/未知异常才算「结果可能不完整」记入 warnings。
+    coupons, warnings = _coupon_candidates(client, store_code,
+                                           be_type=be_type, order_type=order_type,
+                                           be_code=be_code)
+    specified_key = str(coupon or "").strip()
+    specified = bool(specified_key) and specified_key.lower() != "auto"
+    picked = _match_coupon(coupons, specified_key) if specified else None
+    if specified and picked is None:
+        warnings.append(f"指定券 {specified_key} 不在卡包/门店可用券中，已按无券价计")
+    candidates = [picked] if picked else ([] if specified else coupons)
+
+    for c in candidates:
+        cid = str(c.get("id") or c.get("couponId") or "?")
+        ccode = str(c.get("code") or c.get("couponCode") or "")
+        disp = f"{ccode}({cid})" if ccode else cid
         try:
-            r = calc_price(client, store_code, items, c)
+            r = calc_price(client, store_code, items, c,
+                           be_type=be_type, order_type=order_type, be_code=be_code)
+        except NetworkError as e:
+            if specified:
+                warnings.append(f"指定券 {disp} 算价网络错误，已按无券价计：{e}")
+            else:
+                warnings.append(f"券 {cid} 算价网络错误: {e}")
+            continue
+        except McpError as e:
+            if specified:
+                # 用户点名要用的券不可用必须说明原因（如「券没到可用时间」→ 生效窗口）
+                warnings.append(f"指定券 {disp} 当前不可用"
+                                f"（{_coupon_validity_text(c)}），已按无券价计：{e}")
+            continue  # 业务错误：券不适用当前订单，正常过滤，不算「结果不完整」
         except Exception as e:
-            warnings.append(f"券 {c.get('id') or c.get('couponId')} 算价失败: {e}")
+            warnings.append(f"券 {cid} 算价失败: {e}")
             continue
         p = _price_of(r)
         if p < best_price:
@@ -164,7 +274,10 @@ def optimize(client, store_code: str, wanted: list[tuple[str, int]],
             best_price = p
 
     take_way = _pick_take_way(best["result"])
-    draft = _make_draft(store_code, items, best, take_way, track)
+    delivery_ctx = None
+    if be_type == 2:
+        delivery_ctx = {"addressId": None, "beCode": be_code, "addressText": None}
+    draft = _make_draft(store_code, items, best, take_way, track, delivery=delivery_ctx)
     _attach_product_breakdown(draft, best["result"])
     if warnings:
         draft["pricingWarnings"] = warnings
@@ -238,17 +351,18 @@ def _fen2yuan(v) -> float:
 
 
 def _make_draft(store_code: str, items: list[dict], best: dict,
-                take_way: dict | None, track: str) -> dict:
+                take_way: dict | None, track: str, delivery: dict | None = None) -> dict:
     d = best["result"].get("data") if isinstance(best["result"], dict) else best["result"]
     d = d if isinstance(d, dict) else {}
     price = d.get("price")
     orig = d.get("originalPrice")
     discount = d.get("discount")
     coupon = best["coupon"] or {}
+    is_delivery = bool(delivery)
 
-    # 硬校验：取餐方式缺失 / 金额缺失 → 直接报错，不产出不可下单或误导的草稿
+    # 硬校验：金额缺失 → 直接报错；取餐方式仅到店必填（外卖无 takeWayList）
     take_way_code = (take_way or {}).get("code") or (take_way or {}).get("takeWayCode") or ""
-    if not take_way_code:
+    if not is_delivery and not take_way_code:
         raise ValueError("算价结果缺少取餐方式（takeWayList 为空），无法生成可下单草稿")
     yuan = _fen2yuan(price)
     if yuan <= 0:
@@ -257,9 +371,17 @@ def _make_draft(store_code: str, items: list[dict], best: dict,
     draft = {
         "storeCode": store_code,
         "storeName": d.get("storeName") or store_code,
-        "takeWay": "pickup",
+        "takeWay": "delivery" if is_delivery else "pickup",
         "takeWayCode": take_way_code,
-        "takeWayName": (take_way or {}).get("title") or (take_way or {}).get("name") or "",
+        "takeWayName": (take_way or {}).get("title") or (take_way or {}).get("name") or
+                       ("麦乐送" if is_delivery else ""),
+        "orderType": 2 if is_delivery else 1,
+        "beType": 2 if is_delivery else 1,
+        "beCode": (delivery or {}).get("beCode") or "",
+        "addressId": (delivery or {}).get("addressId") or "",
+        "addressText": (delivery or {}).get("addressText") or "",
+        "deliveryFee": _fen2yuan(d.get("deliveryPrice")),
+        "packingFee": _fen2yuan(d.get("packingPrice")),
         "quotedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         "items": items,
         "coupon": ({
@@ -275,6 +397,7 @@ def _make_draft(store_code: str, items: list[dict], best: dict,
             f"原价{_fen2yuan(orig)} - 券{_fen2yuan(discount)} = {_fen2yuan(price)}"
             if best["coupon"] else f"原价{_fen2yuan(orig)}，未用券 {_fen2yuan(price)}"
         ),
+        # 即时单（定时任务亦然：到点提醒+人工确认，不做预约单），字段仅为兼容预留
         "reservationDate": None,
         "source": ("global-lowest" if track == "global" else "top3-history"),
     }
@@ -290,9 +413,150 @@ def reprice_draft(client, draft: dict) -> dict:
 
     下单前把「用户看过的那份草稿」与「此刻重新算出的草稿」比对，
     价格/券/商品有变化就拒绝并重新展示（见 order_exec.diff_draft）。
+
+    ⚠️ 原始 items 的完整结构（roundList / modification / 替换项 / 套餐规格等
+    服务端要求的扩展字段）必须**原样透传**给 calculate-price 并保留在新草稿里：
+    以前按 (name, quantity) 重建 items 会丢失这些字段，导致带套餐规格的定制
+    商品重算价后与原草稿 diff 出「商品清单已变化」，被确认闸误拦、无法下单。
+    只更新服务端重新报价后确实变化的价格 / 券 / 取餐方式；
+    reservationDate / addressId / addressText 等用户既定字段原样保留。
     """
-    wanted = [(it.get("name") or it.get("productCode"), int(it.get("quantity") or 1))
-              for it in (draft.get("items") or [])]
-    if not wanted:
+    items = json.loads(json.dumps(draft.get("items") or []))   # 深拷贝，避免污染原草稿
+    if not items:
         raise ValueError("草稿缺少商品清单，无法重新算价")
-    return optimize(client, draft["storeCode"], wanted, track="global")
+    delivery = None
+    if draft.get("orderType") == 2 or draft.get("takeWay") == "delivery":
+        delivery = {
+            "addressId": draft.get("addressId"),
+            "beCode": draft.get("beCode"),
+            "addressText": draft.get("addressText"),
+        }
+    fresh = _best_quote(client, draft["storeCode"], items,
+                        be_type=2 if delivery else 1,
+                        order_type=2 if delivery else 1,
+                        be_code=(delivery or {}).get("beCode"))
+    # 用户既定字段不参与「重新报价」：保留原值，避免 diff 误报变化
+    fresh["reservationDate"] = draft.get("reservationDate")
+    fresh["addressId"] = draft.get("addressId") or ""
+    fresh["addressText"] = draft.get("addressText") or ""
+    return fresh
+
+
+def optimize_dual(client, store_code: str, wanted: list[tuple[str, int]],
+                  delivery: dict | None = None) -> dict:
+    """双轨候选：同时算「全局最低」与「常买 Top3」两条候选，供用户二选一。
+
+    返回 {"global": draft, "top3": draft | None, "warnings": [...]}。
+    top3 轨道失败（如常买商品该店不可买）不拖垮 global：降级为单候选并记 warnings。
+    """
+    g = optimize(client, store_code, wanted, track="global", delivery=delivery)
+    warnings: list[str] = []
+    t = None
+    try:
+        t = optimize(client, store_code, wanted, track="top3", delivery=delivery)
+    except (ValueError, McpError) as e:
+        warnings.append(f"常买Top3 轨道不可用，仅有全局最低候选：{e}")
+    return {"global": g, "top3": t, "warnings": warnings}
+
+
+def _store_open(s: dict) -> bool:
+    """businessStatus 宽容解析：字段缺失/未知不误杀，明确的「休息/停业」才排除。
+
+    实测 CLI 展示口径：businessStatus 真值=营业中。为稳妥按类型分派：
+    布尔/数值按真假；字符串含「休/close/rest」或为 "0"/"false" 视为休息，
+    其余（如「营业中」「open」）视为营业中。
+    """
+    st = s.get("businessStatus")
+    if st in (None, ""):
+        return True
+    if isinstance(st, bool):
+        return st
+    if isinstance(st, (int, float)):
+        return st != 0
+    t = str(st).strip().lower()
+    if not t or t in ("1", "true"):
+        return True
+    if t in ("0", "false") or "休" in t or "close" in t or "rest" in t:
+        return False
+    return True
+
+
+def resolve_delivery(client, address_id: str, store_code: str | None = None,
+                     be_code: str | None = None) -> dict:
+    """外卖前置：给定配送地址，解析出可下单的 (storeCode, beCode, addressText)。
+
+    返回 {"addressId","storeCode","beCode","addressText","storeName"}。
+    - 指定了 store_code + be_code → 校验该门店确实配送该地址、beCode 与接口
+      一致（防无效组合直送算价接口），通过后直接用并回填地址文本；
+    - 只指定 store_code → 从可配送门店按 storeCode 匹配 beCode（休息中报错）；
+    - 都不指定 → 取第一个**营业中**的可配送门店。
+    """
+    if not address_id:
+        raise ValueError("外卖需要配送地址 addressId")
+
+    # 地址文本（拿不到不致命，beCode/门店才是下单关键）
+    address_text = ""
+    try:
+        raw = client.delivery_addresses()
+        d = raw.get("data") if isinstance(raw, dict) else raw
+        addrs = (d or {}).get("addresses") or [] if isinstance(d, dict) else []
+        for a in addrs:
+            if str(a.get("addressId")) == str(address_id):
+                address_text = (a.get("fullAddress") or "").strip()
+                break
+    except Exception:
+        pass
+
+    def _fetch_stores() -> list[dict]:
+        raw = client.delivery_stores(address_id)
+        d = raw.get("data") if isinstance(raw, dict) else raw
+        stores = d if isinstance(d, list) else (d or {}).get("list") \
+            or (d or {}).get("stores") or []
+        return [s for s in stores if isinstance(s, dict)]
+
+    if be_code and store_code:
+        # 统一校验「门店 / 业务码 / 配送地址」三者关系：门店必须配送该地址，
+        # 且接口给出的 beCode 与传入一致（不一致说明业务码过期或张冠李戴）
+        stores = _fetch_stores()
+        hit = next((s for s in stores
+                    if str(s.get("storeCode")) == str(store_code)), None)
+        if hit is None:
+            names = "、".join(f"{s.get('storeName')}({s.get('storeCode')})"
+                              for s in stores[:6])
+            raise ValueError(f"门店 {store_code} 不配送该地址；可配送门店：{names}")
+        listed = str(hit.get("beCode") or "")
+        if listed and listed != str(be_code):
+            raise ValueError(f"门店 {store_code} 在该地址的业务编码为 {listed}，"
+                             f"与传入 beCode={be_code} 不一致，请重新用 delivery 查询")
+        if not _store_open(hit):
+            raise ValueError(f"门店 {store_code} 当前休息中，暂不可外卖配送")
+        return {"addressId": str(address_id), "storeCode": str(store_code),
+                "beCode": str(be_code), "addressText": address_text, "storeName": ""}
+
+    stores = _fetch_stores()
+    if not stores:
+        raise ValueError("该配送地址暂无可配送门店")
+
+    chosen = None
+    if store_code:
+        for s in stores:
+            if str(s.get("storeCode")) == str(store_code):
+                chosen = s
+                break
+        if not chosen:
+            names = "、".join(f"{s.get('storeName')}({s.get('storeCode')})" for s in stores[:6])
+            raise ValueError(f"门店 {store_code} 不配送该地址；可配送门店：{names}")
+        if not _store_open(chosen):
+            raise ValueError(f"门店 {store_code} 当前休息中，暂不可外卖配送")
+    else:
+        open_stores = [s for s in stores if _store_open(s)]
+        if not open_stores:
+            raise ValueError("该配送地址的可配送门店均休息中，暂不可外卖下单")
+        chosen = open_stores[0]
+
+    resolved_be = str(chosen.get("beCode") or "")
+    if not resolved_be:
+        raise ValueError(f"可配送门店 {chosen.get('storeCode')} 缺少 beCode，无法算价")
+    return {"addressId": str(address_id), "storeCode": str(chosen.get("storeCode")),
+            "beCode": resolved_be, "addressText": address_text,
+            "storeName": chosen.get("storeName") or ""}

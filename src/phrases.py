@@ -56,6 +56,16 @@ PHRASES = [
     {"phrase": "看看某店菜单", "keys": ["菜单", "有什么吃的", "看看菜单"],
      "intent": "meals", "cmd": "python main.py meals --store <门店code>",
      "type": None, "note": "顺便可加 --save 刷新低价基线"},
+    {"phrase": "我想点外卖 / 麦乐送送到家", "keys": ["外卖", "点外卖", "麦乐送", "配送地址", "外卖地址", "外送"],
+     "intent": "delivery", "cmd": "python main.py delivery", "type": None,
+     "note": "先查配送地址，再 --address-id 查可配送门店；算价用 best --delivery"},
+    {"phrase": "算一下外卖多少钱 / 送到家多少钱",
+     "keys": ["外卖", "外卖多少钱", "外卖价格", "送到家多少钱", "送到家多少",
+              "外送价格", "麦乐送多少钱"],
+     "intent": "best_delivery",
+     "cmd": 'python main.py best --delivery --address-id <地址id> --items "<商品> x1"',
+     "type": "confirm", "need_confirm": True,
+     "note": "麦乐送外卖算价（含配送费/打包费）；门店可省略自动选可配送门店"},
 
     # ---------- 下单确认闸 ----------
     {"phrase": "确认下单 / 就这个，下吧", "keys": ["确认下单", "就这个", "下单吧", "买吧"],
@@ -114,13 +124,42 @@ def runnable(intent: str) -> bool:
     return intent not in NEVER_AUTO_RUN
 
 
+def build_argv(cmd: str, store: str = "", item: str = "", draft: str = "",
+               address_id: str = "") -> list[str]:
+    """把话术命令模板 + 占位符值构造成 argv 列表（不经 shell，防注入）。
+
+    先按模板里的引号切分成 argv，再逐 token 替换占位符，好处有二：
+      ① 不拼命令字符串、不交给 shell，杜绝注入；
+      ② 占位符值即使含空格也整体作为一个参数，不会被二次拆分。
+    留空的占位符（如未给 --draft）会连同其前置选项 flag 一起丢弃，避免
+    出现「flag 后无值」。
+    """
+    import shlex
+    subs = {
+        "<门店code>": store or "1421252",
+        "<商品>": item or "麦旋风",
+        "<草稿.json>": draft,
+        "<地址id>": address_id,
+    }
+    out: list[str] = []
+    for tok in shlex.split(cmd):
+        for k, v in subs.items():
+            tok = tok.replace(k, v)
+        if tok == "":
+            if out and out[-1].startswith("-"):
+                out.pop()
+            continue
+        out.append(tok)
+    return out
+
+
 def table_markdown() -> str:
     """生成 README / skill.md 用的话术表。"""
     groups = [
         ("打招呼与自检", ["capabilities", "doctor"]),
-        ("盯价与选店", ["patrol", "stores", "meals"]),
+        ("盯价与选店", ["patrol", "stores", "meals", "delivery"]),
         ("领券", ["coupons_preview", "coupons_claim"]),
-        ("算价与下单", ["best", "order", "cancel", "cancel_unpaid"]),
+        ("算价与下单", ["best", "best_delivery", "order", "cancel", "cancel_unpaid"]),
         ("复盘与分享", ["report", "share"]),
         ("配置与地址", ["address"]),
     ]

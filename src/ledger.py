@@ -49,12 +49,18 @@ def aggregate(period: str = "month") -> dict:
     """按周期聚合账本 → 省钱账单数据源。
 
     period: today | week | month | all
+
+    口径分离（重要）：
+      - saved（实际省下）＝ 仅累计 order（真实下单）的优惠，精确值；
+      - potential（潜在优惠）＝ 仅累计 drop（盯价发现的降价）的估算值，尚未购买。
+      二者**不相加**，避免把「尚未购买的潜在优惠」误当「真实省下」。
+      by_store / by_item 也只聚合 order 的真实优惠，不混入 drop 估算。
     """
     span = {"today": 1, "week": 7, "month": 30, "all": 36500}.get(period, 30)
     since = _since(span)
     evs = load_events()
 
-    saved, drops, orders = 0.0, 0, 0
+    saved, potential, drops, orders = 0.0, 0.0, 0, 0
     by_store: dict[str, float] = {}
     by_item: dict[str, dict] = {}
     for e in evs:
@@ -65,10 +71,11 @@ def aggregate(period: str = "month") -> dict:
         amount = _num(e.get("saved"))
         if kind == "drop":
             drops += 1
+            potential += amount
+            continue          # drop 是估算，只进「潜在优惠」，不进真实省下/门店/商品榜
         elif kind == "order":
             orders += 1
             saved += amount
-        saved += 0 if kind == "order" else amount
         sc = str(e.get("storeCode") or "")
         if sc:
             by_store[sc] = round(by_store.get(sc, 0.0) + amount, 2)
@@ -83,6 +90,7 @@ def aggregate(period: str = "month") -> dict:
     return {
         "period": period,
         "saved": round(saved, 2),
+        "potential": round(potential, 2),
         "drops": drops,
         "orders": orders,
         "stores": len(by_store),

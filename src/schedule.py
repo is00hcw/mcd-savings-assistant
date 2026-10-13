@@ -5,8 +5,13 @@
 自动**重新算价**（券可能过期、价可能变了）→ 推送 confirm 确认消息 → 用户回
 「确认下单」才真正下单。
 
+产品定位（重要）：定时任务 = 「到点重算价 + 提醒 + 人工确认」的**即时单**，
+不做预约单。--at 只是触发算价/提醒的时间；到点确认后按**当下**价格下单、
+当下取餐。草稿的 reservationDate 恒为 None（字段仅为兼容 create-order 的
+预约能力保留）。若要"预约未来取餐"，请到 App 操作或另行明确定义。
+
 红线（最重要）：到点**绝不自动下单**。
-  fire() 只做「重新算价 + 生成确认卡+ 落 outbox」，执行仍需 order --yes 的确认闸。
+  fire() 只做「重新算价 + 生成确认卡 + 落 outbox」，执行仍需 order --yes 的确认闸。
   这是本模块唯一允许的行为，不提供任何跳过确认的开关。
 
 存储：~/.mcd-skill/schedules.json（任务）、~/.mcd-skill/outbox/（到点推送的确认卡）
@@ -34,6 +39,14 @@ KIND_ORDER = "order"   # 到点重算价 → 推送确认卡（不自动下单�
 KIND_ALERT = "alert"   # 到点发一条提醒（纯文本/卡片，无副作用）
 
 
+class LockBusyError(Exception):
+    """锁被另一进程持有（真正的锁竞争）。
+
+    与「锁文件打不开 / 目录无权限」等环境错误严格区分：环境错误应直接暴露，
+    不能被当成「另一进程正在触发」而静默跳过（否则权限异常会让任务被悄悄漏掉）。
+    """
+
+
 # ---------------------------------------------------------------------------
 # 存储
 # ---------------------------------------------------------------------------
@@ -57,20 +70,30 @@ def _exclusive_lock(lock_path: Path):
     """跨进程互斥锁（Windows msvcrt / Unix flock）。
 
     保护「到点判断 → claim → 触发」的状态流转：两个同时运行的定时任务
-    进程不会对同一条任务各生成一份确认草稿。拿不到锁抛 OSError（调用方跳过）。
+    进程不会对同一条任务各生成一份确认草稿。
+
+    失败语义严格区分：
+      · 锁竞争（另一进程已持锁）→ 抛 LockBusyError（fire 层跳过本次）；
+      · 目录创建 / 文件打开失败 → 原样抛 OSError（不应静默跳过）。
     """
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)   # 环境错误：直接暴露
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)  # 环境错误：直接暴露
     try:
         if os.name == "nt":
             import msvcrt
             if os.fstat(fd).st_size == 0:
                 os.write(fd, b"\0")
             os.lseek(fd, 0, 0)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)   # 非阻塞：拿不到抛 OSError
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)   # 非阻塞：拿不到抛 OSError
+            except OSError:
+                raise LockBusyError("另一进程正在触发定时任务") from None
         else:
             import fcntl
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise LockBusyError("另一进程正在触发定时任务") from None
         try:
             yield
         finally:
@@ -330,9 +353,11 @@ def fire(client, sch: dict) -> dict:
     try:
         with _exclusive_lock(FIRE_LOCK_FILE):
             return _fire_locked(client, sch)
-    except OSError:
+    except LockBusyError:
         return {"skipped": True, "id": sch.get("id"),
                 "reason": "另一进程正在触发定时任务，本次跳过"}
+    # 目录创建 / 文件打开失败等环境错误（OSError）不在此捕获：直接向上暴露，
+    # 避免权限异常被当成「锁竞争」而静默漏触发。
 
 
 def _fire_locked(client, sch: dict) -> dict:
@@ -367,8 +392,12 @@ def _fire_locked(client, sch: dict) -> dict:
 
         from . import optimize, order_exec
         wanted = _parse_items(sch.get("items") or "")
+        # --coupon 语义与 CLI 声明一致：auto=枚举所有候选券；具体券 id/code=只测
+        # 「无券基线+该券」（不可用时 optimize 记 warning 并注明生效时间窗，
+        # 退回无券价，绝不静默忽略用户指定的券）
         draft = optimize.optimize(client, sch["store"], wanted,
-                                  track=sch.get("track") or "global")
+                                  track=sch.get("track") or "global",
+                                  coupon=sch.get("coupon") or "auto")
         draft["scheduledFrom"] = {"id": sch["id"], "at": sch.get("at"),
                                   "note": sch.get("note")}
         draft["confirmedByHuman"] = False         # 显式标记：尚未获用户确认

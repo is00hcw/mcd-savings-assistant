@@ -124,17 +124,21 @@ def test_present_layers():
 
 
 def test_ledger(tmp):
-    """H 省钱账单：drop 估算 + order 真实优惠聚合。"""
+    """H 省钱账单：drop 估算 + order 真实优惠**分开**（实际省下 ≠ 潜在优惠）。"""
     from src import ledger
     ledger.LEDGER_FILE = tmp / "ledger.jsonl"
     ledger.append_event("drop", name="雪糕", storeCode="S1", saved=3.0)
     ledger.append_event("order", name="麦旋风", storeCode="S1",
                         originalPrice=30.4, price=25.9, saved=4.5)
     agg = ledger.aggregate("all")
-    assert agg["saved"] == 7.5 and agg["drops"] == 1 and agg["orders"] == 1
-    assert agg["items"][0]["name"] in ("雪糕", "麦旋风")
+    assert agg["saved"] == 4.5, "实际省下应只含 order 真实优惠"
+    assert agg["potential"] == 3.0, "潜在优惠应只含 drop 估算"
+    assert agg["drops"] == 1 and agg["orders"] == 1
+    assert agg["items"][0]["name"] == "麦旋风", "商品榜只统计真实下单，不混入 drop 估算"
     r = payloads_report(agg)
     assert r["type"] == "report" and r["preferredRender"] == "html"
+    labels = [m["label"] for m in r["metrics"]]
+    assert "实际省下" in labels and "潜在优惠(未购买)" in labels
 
 
 def payloads_report(agg):
@@ -296,6 +300,7 @@ def test_schedule():
         tmp = Path(td)
         sch.SCHEDULE_FILE = tmp / "schedules.json"
         sch.OUTBOX_DIR = tmp / "outbox"
+        sch.FIRE_LOCK_FILE = tmp / ".fire.lock"
         order_exec.DRAFT_DIR = tmp / "drafts"
 
         s = sch.add(kind="order", at="08:00", store="1421252", items="麦旋风 x1", note="早餐")
@@ -573,7 +578,7 @@ def test_price_failures_raise():
 
     class Bad:
         def my_coupons(self): raise RuntimeError("boom")
-        def store_coupons(self, s): return {"data": {"coupons": [{"id": "1"}]}}
+        def store_coupons(self, s, **kw): return {"data": {"coupons": [{"id": "1"}]}}
     coupons, warnings = optimize._coupon_candidates(Bad(), "S")
     assert len(coupons) == 1 and any("失败" in w for w in warnings)
 
@@ -722,6 +727,8 @@ def test_cancel_payload():
     assert p["type"] == "confirm"
     assert {a["id"] for a in p["actions"]} == {"cancel_all", "keep"}
     assert "取消不可逆" in p["meta"]["hint"]
+    assert "近期" in p["meta"]["hint"], "必须明确扫描范围仅近期可见订单"
+    assert "近期" in p["summary"]
     txt = present.render_inline(p)
     assert "待确认取消" in txt and "[确认取消]" in txt
     assert "python main.py cancel" not in txt  # command 不给终端用户看
@@ -729,6 +736,771 @@ def test_cancel_payload():
     r = payloads.cancel_unpaid_receipt({"cancelled": [{"orderId": "o2"}], "failed": []})
     assert r["type"] == "alert"
     assert r["metrics"][0]["value"] == 1
+
+
+def test_no_retry_on_write():
+    """写操作（含免费写）网络层错误禁重试；读操作仍重试。"""
+    from src.mcd_client import McdClient, NetworkError
+    captured = {}
+
+    class Spy(McdClient):
+        def __init__(self):
+            self.token = "x"; self.endpoint = "http://x"
+            self._call_ts = []; self._id = 0; self._initialized = True
+
+        def rpc(self, method, params=None, notify=False, retry_network=True):
+            captured[params["name"]] = retry_network
+            return {"structuredContent": {"ok": True}}
+
+    s = Spy()
+    s.call("create-order", {"x": 1}, confirm=True)
+    s.call("cancel-order", {}, confirm=True)
+    s.call("mall-create-order", {}, confirm=True)
+    s.call("auto-bind-coupons", {})      # 免费写操作同样禁重试
+    s.call("delivery-create-address", {})
+    s.call("query-meals", {})            # 读操作可重试
+    assert captured["create-order"] is False
+    assert captured["cancel-order"] is False
+    assert captured["mall-create-order"] is False
+    assert captured["auto-bind-coupons"] is False
+    assert captured["delivery-create-address"] is False
+    assert captured["query-meals"] is True
+
+
+def test_post_network_no_retry():
+    """_post：retry_network=False 时网络错误立即抛 NetworkError 且只发一次请求。"""
+    import urllib.request as _ur
+    import urllib.error
+    from src.mcd_client import McdClient, NetworkError
+
+    n = {"count": 0}
+    orig = _ur.urlopen
+
+    class Spy(McdClient):
+        def __init__(self):
+            self.token = "x"; self.endpoint = "http://x"; self._call_ts = []
+
+        def _throttle(self):
+            pass  # 跳过限流
+
+    def fake_urlopen(req, timeout=None):
+        n["count"] += 1
+        raise urllib.error.URLError("connection lost")
+
+    _ur.urlopen = fake_urlopen
+    try:
+        s = Spy()
+        try:
+            s._post({"a": 1}, retry_network=False)
+            assert False, "应抛 NetworkError"
+        except NetworkError:
+            pass
+        assert n["count"] == 1, "写操作网络错误不应重试"
+    finally:
+        _ur.urlopen = orig
+
+
+def test_uncertain_order_probe():
+    """下单网络层结果不确定：只提交一次、查订单状态、返回 uncertain 回执（不重复下单）。"""
+    from src import order_exec
+    from src.mcd_client import NetworkError
+
+    draft = {
+        "storeCode": "1421252", "takeWayCode": "eat-in",
+        "items": [{"productCode": "4810", "quantity": 2}],
+        "coupon": {"couponId": "1", "couponCode": "ABC", "name": "券"},
+        "price": 25.0, "originalPrice": 30.0,
+        "confirmedByHuman": True, "confirmedAt": "2026-10-13 12:00:00",
+        "confirmedText": "确认下单",
+    }
+
+    # 场景 A：服务端已建单但响应丢失 → 探测到新增未支付订单
+    class FakeA:
+        def __init__(self): self.created = False; self.create_calls = 0
+        def order_list(self):
+            orders = [{"orderId": "old1", "orderStatus": "订单已完成"}]
+            if self.created:
+                orders.append({"orderId": "new1", "orderStatus": "待支付"})
+            return {"data": {"list": orders}}
+        def call(self, name, args=None, confirm=False):
+            if name == "create-order":
+                self.create_calls += 1
+                self.created = True   # 模拟服务端已创建订单
+                raise NetworkError("网络错误（结果不确定）: connection lost")
+            raise AssertionError(name)
+
+    fa = FakeA()
+    r = order_exec.execute_draft(fa, draft)
+    assert r["status"] == "uncertain"
+    assert fa.create_calls == 1, "create-order 只提交一次，绝不重试"
+    assert r["probe"]["newUnpaidOrder"] is True
+    assert "很可能已成功" in r["probe"]["note"]
+
+    # 场景 B：响应丢失但服务端未建单 → 未发现新增
+    class FakeB:
+        def __init__(self): self.create_calls = 0
+        def order_list(self):
+            return {"data": {"list": [{"orderId": "old1", "orderStatus": "订单已完成"}]}}
+        def call(self, name, args=None, confirm=False):
+            if name == "create-order":
+                self.create_calls += 1
+                raise NetworkError("网络错误: connection lost")
+            raise AssertionError(name)
+    fb = FakeB()
+    r2 = order_exec.execute_draft(fb, draft)
+    assert r2["status"] == "uncertain" and r2["probe"]["newUnpaidOrder"] is False
+
+    # 场景 C：快照查询失败 → before_ids=None，仍返回 uncertain（不重复提交）
+    class FakeC:
+        def __init__(self): self.create_calls = 0
+        def order_list(self): raise RuntimeError("query fail")
+        def call(self, name, args=None, confirm=False):
+            if name == "create-order":
+                self.create_calls += 1
+                raise NetworkError("网络错误: connection lost")
+            raise AssertionError(name)
+    fc = FakeC()
+    r3 = order_exec.execute_draft(fc, draft)
+    assert r3["status"] == "uncertain" and r3["probe"]["queried"] is False
+    assert fc.create_calls == 1
+
+
+def test_draft_binding_hardening():
+    """确认绑定草稿：强制 digest、diff 比较门店/取餐/预约、草稿 ID 不重复。"""
+    from src import order_exec
+    import tempfile as _tf
+
+    # ① 无 digest 的草稿必须拒绝（不能靠删 digest 字段绕过篡改检测）
+    no_digest = {
+        "storeCode": "1421252", "takeWayCode": "eat-in",
+        "items": [{"productCode": "4810", "quantity": 2}],
+        "price": 25.0, "originalPrice": 30.0,
+    }
+    ok, reason = order_exec.validate_for_order(no_digest)
+    assert not ok and "digest" in reason
+
+    # ② diff 比较门店 / 取餐方式 / 预约时间（此前只比价格/券/商品，漏了这三项）
+    base = {
+        "storeCode": "1421252", "takeWayCode": "eat-in",
+        "items": [{"productCode": "4810", "quantity": 2}],
+        "coupon": None, "price": 25.0, "originalPrice": 30.0,
+        "reservationDate": None,
+    }
+    s = dict(base); s["storeCode"] = "9999999"
+    assert any("门店" in c for c in order_exec.diff_draft(base, s))
+    t = dict(base); t["takeWayCode"] = "delivery"
+    assert any("取餐方式" in c for c in order_exec.diff_draft(base, t))
+    r = dict(base); r["reservationDate"] = "2026-10-14 12:00"
+    assert any("预约时间" in c for c in order_exec.diff_draft(base, r))
+    assert order_exec.diff_draft(base, dict(base)) == []
+
+    # ③ 草稿 ID 去重：同秒保存内容不同的两份草稿不互相覆盖
+    with _tf.TemporaryDirectory() as td:
+        import pathlib
+        _orig = order_exec.DRAFT_DIR
+        order_exec.DRAFT_DIR = pathlib.Path(td)
+        try:
+            d1 = order_exec.save_draft(dict(base))
+            d2 = order_exec.save_draft({**base, "price": 26.0})  # 内容不同
+            assert d1 != d2 and d1.exists() and d2.exists()
+            assert d1.read_text(encoding="utf-8") != d2.read_text(encoding="utf-8")
+        finally:
+            order_exec.DRAFT_DIR = _orig
+
+
+def test_delivery_support():
+    """外卖支持：草稿字段 / digest 覆盖 / diff 捕捉 / 下单参数 / 门店解析。"""
+    import tempfile as _tf
+    import pathlib
+    from src import order_exec, optimize, payloads, present
+
+    # ① _make_draft 外卖：无 takeWayList 不报错，字段正确
+    draft = optimize._make_draft(
+        "1421252", [{"productCode": "901401", "quantity": 1, "name": "麦乐鸡5块"}],
+        {"coupon": None, "result": {"data": {
+            "price": 2230, "originalPrice": 2230, "discount": 0,
+            "deliveryPrice": 600, "packingPrice": 80,
+            "storeName": "麦当劳深圳金环宇大厦餐厅",
+        }}},
+        None, "global",
+        delivery={"addressId": "A1", "beCode": "142125202", "addressText": "深圳某大厦"},
+    )
+    assert draft["takeWay"] == "delivery"
+    assert draft["orderType"] == 2 and draft["beType"] == 2
+    assert draft["beCode"] == "142125202" and draft["addressId"] == "A1"
+    assert draft["takeWayCode"] == ""            # 外卖无 takeWayCode
+    assert draft["deliveryFee"] == 6.0 and draft["packingFee"] == 0.8
+    assert draft["price"] == 22.3
+
+    # ② draft_digest 覆盖 addressId/beCode（改地址/业务码会改摘要）
+    d0 = order_exec.draft_digest(draft)
+    assert order_exec.draft_digest({**draft, "addressId": "A2"}) != d0
+    assert order_exec.draft_digest({**draft, "beCode": "X"}) != d0
+
+    # ③ diff_draft 捕捉外卖字段
+    assert any("业务编码" in c for c in order_exec.diff_draft(draft, {**draft, "beCode": "999"}))
+    assert any("配送地址" in c for c in order_exec.diff_draft(draft, {**draft, "addressId": "B"}))
+    assert any("配送费" in c for c in order_exec.diff_draft(draft, {**draft, "deliveryFee": 9.0}))
+    assert order_exec.diff_draft(draft, dict(draft)) == []
+
+    # ④ execute_draft 外卖下单参数：不传 takeWayCode，传 orderType/beType/beCode/addressId
+    confirmed = dict(draft)
+    confirmed["confirmedByHuman"] = True
+    confirmed["confirmedAt"] = "2026-10-13 15:00:00"
+    confirmed["confirmedText"] = "确认下单"
+
+    captured = {}
+
+    class CapClient:
+        def order_list(self):
+            return {"data": {"list": []}}
+        def call(self, name, arguments=None, confirm=False):
+            captured["name"], captured["args"], captured["confirm"] = name, arguments, confirm
+            return {"orderId": "O123", "success": True}
+
+    with _tf.TemporaryDirectory() as td:
+        _orig = order_exec.RECEIPT_LOG
+        order_exec.RECEIPT_LOG = pathlib.Path(td) / "receipts.jsonl"
+        try:
+            order_exec.execute_draft(CapClient(), confirmed)
+        finally:
+            order_exec.RECEIPT_LOG = _orig
+    assert captured["name"] == "create-order"
+    a = captured["args"]
+    assert a["orderType"] == 2 and a["beType"] == 2
+    assert a["beCode"] == "142125202" and a["addressId"] == "A1"
+    assert "takeWayCode" not in a              # 外卖不传 takeWayCode
+    assert captured["confirm"] is True
+
+    # ⑤ resolve_delivery：指定 store 自动解析 beCode + 回填地址文本
+    class ResClient:
+        def delivery_addresses(self):
+            return {"data": {"addresses": [{"addressId": "A1", "fullAddress": "深圳某大厦"}]}}
+        def delivery_stores(self, address_id, be_type=2):
+            return {"data": [{"storeCode": "1421252", "beCode": "142125202",
+                              "storeName": "金环宇"}]}
+
+    resolved = optimize.resolve_delivery(ResClient(), "A1", store_code="1421252")
+    assert resolved["beCode"] == "142125202" and resolved["storeCode"] == "1421252"
+    assert resolved["addressText"] == "深圳某大厦"
+
+    # ⑥ confirm 卡外卖 metric + 配送地址展示
+    p = payloads.confirm_from_draft(draft, "d.json")
+    labels = [m["label"] for m in p["metrics"]]
+    assert "配送费" in labels and "打包费" in labels
+    assert "配送至" in present.render_inline(p)
+
+
+def test_timeout_to_network_error():
+    """传输层超时（TimeoutError/socket.timeout）统一转 NetworkError，写操作不重试。"""
+    import urllib.request as _ur
+    from src.mcd_client import McdClient, NetworkError
+
+    orig = _ur.urlopen
+
+    class Spy(McdClient):
+        def __init__(self):
+            self.token = "x"; self.endpoint = "http://x"; self._call_ts = []
+        def _throttle(self):
+            pass  # 跳过限流
+
+    # 写操作（retry_network=False）：超时只发一次，直接抛 NetworkError
+    n = {"count": 0}
+    def fake_timeout(req, timeout=None):
+        n["count"] += 1
+        raise TimeoutError("timed out")
+    _ur.urlopen = fake_timeout
+    try:
+        s = Spy()
+        try:
+            s._post({"a": 1}, retry_network=False)
+            assert False, "超时应抛 NetworkError"
+        except NetworkError:
+            pass
+        assert n["count"] == 1, "写操作超时不应重试"
+    finally:
+        _ur.urlopen = orig
+
+    # 读操作（retry_network=True）：超时应重试 3 次后才抛 NetworkError
+    n["count"] = 0
+    _ur.urlopen = fake_timeout
+    try:
+        s = Spy()
+        try:
+            s._post({"a": 1})
+            assert False, "应抛 NetworkError"
+        except NetworkError:
+            pass
+        assert n["count"] == 3, "读操作超时应重试 3 次"
+    finally:
+        _ur.urlopen = orig
+
+
+def test_digest_covers_full_items():
+    """摘要与 diff 覆盖商品完整业务字段（roundList/替换项/规格），非仅 productCode+quantity。"""
+    from src import order_exec
+    import time
+
+    base = {
+        "storeCode": "1421252", "takeWayCode": "eat-in",
+        "items": [{"productCode": "4810", "quantity": 2,
+                   "roundList": [{"id": "r1", "name": "原味"}],
+                   "spec": "大份"}],
+        "coupon": None, "price": 25.0, "originalPrice": 30.0,
+        "reservationDate": None,
+    }
+    d0 = order_exec.draft_digest(base)
+
+    # 只改 roundList（productCode/quantity/价格/券全不变）→ 摘要必须变化
+    alt = json.loads(json.dumps(base))
+    alt["items"][0]["roundList"] = [{"id": "r2", "name": "替换"}]
+    assert order_exec.draft_digest(alt) != d0
+
+    # 只加替换项字段 → 摘要必须变化
+    alt2 = json.loads(json.dumps(base))
+    alt2["items"][0]["replaceItem"] = {"productCode": "999"}
+    assert order_exec.draft_digest(alt2) != d0
+
+    # diff 必须捕捉（不只比 productCode+quantity）
+    assert order_exec.diff_draft(base, alt) == ["商品清单已变化"]
+    assert order_exec.diff_draft(base, alt2) == ["商品清单已变化"]
+    assert order_exec.diff_draft(base, json.loads(json.dumps(base))) == []
+
+    # 完整链路：篡改 roundList 后 validate_for_order 拒绝（digest 对不上）
+    draft = dict(base)
+    draft["digest"] = order_exec.draft_digest(base)
+    draft["quotedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    ok, _ = order_exec.validate_for_order(draft)
+    assert ok, "原始草稿应通过"
+    tampered = json.loads(json.dumps(draft))
+    tampered["items"][0]["roundList"] = [{"id": "r2", "name": "替换"}]
+    ok2, reason2 = order_exec.validate_for_order(tampered)
+    assert not ok2 and "不一致" in reason2
+
+
+def test_digest_covers_request_fields():
+    """摘要覆盖 execute_draft 实际发送的全部字段：beType / reservationDate /
+    couponId / couponCode（任一被篡改，摘要与 diff 都要变化）。"""
+    from src import order_exec
+    import time
+
+    base = {
+        "storeCode": "1421252", "takeWayCode": "eat-in",
+        "orderType": 1, "beType": 1, "beCode": "", "addressId": "",
+        "reservationDate": None,
+        "items": [{"productCode": "4810", "quantity": 1}],
+        "coupon": {"couponId": "100", "couponCode": "COUPON-ABC",
+                   "name": "9.9券", "expireAt": ""},
+        "price": 9.9, "originalPrice": 15.0,
+    }
+    d0 = order_exec.draft_digest(base)
+
+    # ① beType 篡改 → 摘要变化 + diff 捕捉
+    assert order_exec.draft_digest({**base, "beType": 2}) != d0
+    assert any("业务类型" in c for c in order_exec.diff_draft(base, {**base, "beType": 2}))
+
+    # ② reservationDate 篡改 → 摘要变化 + diff 捕捉
+    assert order_exec.draft_digest({**base, "reservationDate": "2026-10-14 12:00"}) != d0
+    assert any("预约时间" in c for c in order_exec.diff_draft(
+        base, {**base, "reservationDate": "2026-10-14 12:00"}))
+
+    # ③ 只改 couponId（couponCode 不变）→ 摘要变化 + diff 捕捉
+    alt_cid = json.loads(json.dumps(base))
+    alt_cid["coupon"]["couponId"] = "999"
+    assert order_exec.draft_digest(alt_cid) != d0
+    assert any("用券" in c for c in order_exec.diff_draft(base, alt_cid))
+
+    # ④ 只改 couponCode（couponId 不变）→ 摘要变化 + diff 捕捉
+    alt_ccode = json.loads(json.dumps(base))
+    alt_ccode["coupon"]["couponCode"] = "COUPON-XYZ"
+    assert order_exec.draft_digest(alt_ccode) != d0
+    assert any("用券" in c for c in order_exec.diff_draft(base, alt_ccode))
+
+    # ⑤ 完整链路：篡改 beType 后 validate_for_order 拒绝（digest 对不上）
+    draft = dict(base)
+    draft["digest"] = order_exec.draft_digest(base)
+    draft["quotedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    assert order_exec.validate_for_order(draft)[0], "原始草稿应通过"
+    tampered = json.loads(json.dumps(draft))
+    tampered["beType"] = 2
+    ok2, reason2 = order_exec.validate_for_order(tampered)
+    assert not ok2 and "不一致" in reason2
+
+    # ⑥ 只改 couponCode 后 validate_for_order 也拒绝
+    tampered2 = json.loads(json.dumps(draft))
+    tampered2["coupon"]["couponCode"] = "COUPON-XYZ"
+    ok3, reason3 = order_exec.validate_for_order(tampered2)
+    assert not ok3 and "不一致" in reason3
+
+
+def test_build_argv_no_shell():
+    """phrase --run 用 argv 列表调用（不经 shell），占位符值整体作为一个参数。"""
+    from src import phrases as ph
+
+    # best 模板：门店/商品占位符替换正确，商品值含空格也整体一个参数
+    argv = ph.build_argv('python main.py best --store <门店code> --items "<商品> x1"',
+                         store="1421252", item="经典麦旋风")
+    assert argv == ["python", "main.py", "best", "--store", "1421252",
+                    "--items", "经典麦旋风 x1"]
+
+    # 注入尝试：值里的 shell 元字符不被解释、不被拆散，只作为字面参数
+    argv2 = ph.build_argv('python main.py best --store <门店code> --items "<商品> x1"',
+                          store="1;rm -rf /", item='x" && echo hacked')
+    assert argv2 == ["python", "main.py", "best", "--store", "1;rm -rf /",
+                     "--items", 'x" && echo hacked x1']
+
+    # 外卖模板：--address-id 占位符被替换
+    argv3 = ph.build_argv(
+        'python main.py best --delivery --address-id <地址id> --items "<商品> x1"',
+        item="麦辣鸡腿堡", address_id="ADDR-1")
+    assert argv3 == ["python", "main.py", "best", "--delivery",
+                     "--address-id", "ADDR-1", "--items", "麦辣鸡腿堡 x1"]
+
+    # 留空占位符：未给 --draft 时，空占位符连同其 flag 一起丢弃
+    argv4 = ph.build_argv('python main.py share --draft <草稿.json>', draft="")
+    assert argv4 == ["python", "main.py", "share"]
+
+
+def test_raw_readonly_gate():
+    """raw 调试入口只放行 READ_ONLY：免费写（领券/建地址）与花钱动作一律拦截。"""
+    import main as m
+
+    # 只读工具放行
+    assert m._raw_tool_gate("query-meals") is None
+    assert m._raw_tool_gate("calculate-price") is None
+
+    # 免费写动作拦截（与帮助文字「任意只读工具」对齐）
+    assert m._raw_tool_gate("auto-bind-coupons") is not None
+    assert m._raw_tool_gate("delivery-create-address") is not None
+
+    # 花钱动作拦截
+    assert m._raw_tool_gate("create-order") is not None
+    assert m._raw_tool_gate("cancel-order") is not None
+
+    # 白名单之外的工具也拦截
+    assert m._raw_tool_gate("not-a-real-tool") is not None
+
+
+def test_lock_error_semantics():
+    """锁竞争返回 skipped；目录/文件打开环境错误直接暴露，不被静默跳过。"""
+    from src import schedule as sch
+    from src.mcd_client import McdClient
+    import tempfile as _tf
+
+    with _tf.TemporaryDirectory() as td:
+        tmp = Path(td)
+        sch.SCHEDULE_FILE = tmp / "schedules.json"
+        sch.OUTBOX_DIR = tmp / "outbox"
+
+        # ① 环境错误：锁文件父路径是「文件」而非目录 → mkdir 抛 OSError，应直接暴露
+        blocker = tmp / "blocker"
+        blocker.write_text("x")
+        sch.FIRE_LOCK_FILE = blocker / ".lock"
+        s = sch.add(kind="alert", at="09:00", note="环境错误测试")
+        try:
+            sch.fire(sch._NoMoneyClient(McdClient("x")), s)
+            assert False, "目录创建失败应直接暴露（不返回 skipped）"
+        except OSError:
+            pass
+
+        # ② 锁竞争：另一处已持锁 → fire 返回 skipped，而不是异常
+        sch.FIRE_LOCK_FILE = tmp / ".fire.lock"
+        s2 = sch.add(kind="alert", at="09:00", note="锁竞争测试")
+        with sch._exclusive_lock(sch.FIRE_LOCK_FILE):
+            try:
+                with sch._exclusive_lock(sch.FIRE_LOCK_FILE):
+                    assert False, "应抛 LockBusyError"
+            except sch.LockBusyError:
+                pass
+            r = sch.fire(sch._NoMoneyClient(McdClient("x")), s2)
+            assert r.get("skipped") is True and "另一进程" in r["reason"]
+
+
+def _quote_fake_client(coupons=None, coupon_price=None):
+    """算价测试通用 Fake：菜单两款商品 + 卡包券；coupon_code=BBB 模拟「券没到可用时间」。"""
+    from src.mcd_client import McpError
+
+    coupons = coupons if coupons is not None else [
+        {"id": "C1", "code": "AAA", "title": "生效券",
+         "tradeStartDateTime": "2026-10-01 00:00:00",
+         "tradeEndDateTime": "2026-10-31 23:59:59"},
+        {"id": "C2", "code": "BBB", "title": "未生效券",
+         "tradeStartDateTime": "2026-10-20 00:00:00",
+         "tradeEndDateTime": "2026-10-25 23:59:59"},
+    ]
+    calls = []
+
+    class Fake:
+        def call(self, name, args=None, confirm=False):
+            calls.append((name, args))
+            if name == "query-meals":
+                return {"data": {"meals": {
+                    "4810": {"name": "薯条", "code": "4810",
+                             "currentPrice": 12.5, "originalPrice": 12.5},
+                    "4811": {"name": "麦旋风", "code": "4811",
+                             "currentPrice": 15.5, "originalPrice": 15.5},
+                }}}
+            if name == "query-my-coupons":
+                return {"data": {"coupons": coupons}}
+            if name == "query-store-coupons":
+                return {"data": {"coupons": []}}
+            if name == "calculate-price":
+                code = (args["items"][0] or {}).get("couponCode")
+                if code == "BBB":
+                    raise McpError("当前优惠券不可用（未到生效时间）")
+                price = coupon_price.get(code, 2500) if coupon_price else 2500
+                return {"data": {"price": price, "originalPrice": 2500, "discount": 0,
+                                 "takeWayList": [{"code": "eat-in", "title": "堂食"}],
+                                 "storeName": "测试店"}}
+            raise AssertionError(f"不应调用 {name}")
+
+        def meals(self, store_code, **kw):
+            return self.call("query-meals", kw or {})
+
+        def my_coupons(self):
+            return self.call("query-my-coupons")
+
+        def store_coupons(self, store_code, **kw):
+            return self.call("query-store-coupons")
+
+    return Fake(), calls
+
+
+def test_reprice_preserves_items():
+    """P1 回归：reprice_draft 必须保留 items 完整结构（roundList/modification/
+    替换项/规格）与 reservationDate，不能再按 (name, qty) 重建导致定制商品被
+    确认闸误拦（diff 出「商品清单已变化」）。"""
+    from src import optimize, order_exec
+
+    cli, calls = _quote_fake_client()
+    draft = {
+        "storeCode": "1421252", "storeName": "测试店", "takeWayCode": "eat-in",
+        "takeWayName": "堂食", "orderType": 1, "beType": 1, "beCode": "",
+        "addressId": "", "addressText": "", "deliveryFee": 0.0, "packingFee": 0.0,
+        "items": [{"productCode": "4810", "name": "薯条", "quantity": 2,
+                   "roundList": [{"id": "r1", "name": "原味"}],
+                   "modification": [{"type": "noOnion"}],
+                   "replaceItem": {"productCode": "999"},
+                   "spec": "大份",
+                   "unitPrice": 12.5, "subtotal": 25.0}],
+        "coupon": None, "price": 25.0, "originalPrice": 25.0, "discount": 0,
+        "reservationDate": "2026-10-20 12:00",
+        "quotedAt": "2026-10-13 18:00:00",
+    }
+    fresh = optimize.reprice_draft(cli, draft)
+
+    # calculate-price 收到的是完整 item（含套餐规格/替换项），不是重建的 (code, qty)
+    sent = [a for n, a in calls if n == "calculate-price"][0]["items"]
+    assert sent[0].get("roundList") == [{"id": "r1", "name": "原味"}]
+    assert sent[0].get("modification") == [{"type": "noOnion"}]
+    assert sent[0].get("replaceItem") == {"productCode": "999"}
+    assert sent[0].get("spec") == "大份"
+
+    # 新草稿保留完整结构与用户既定字段
+    assert fresh["items"][0].get("roundList") == [{"id": "r1", "name": "原味"}]
+    assert fresh["items"][0].get("modification") == [{"type": "noOnion"}]
+    assert fresh["items"][0].get("replaceItem") == {"productCode": "999"}
+    assert fresh["reservationDate"] == "2026-10-20 12:00"
+
+    # 价格/券/商品都没变 → diff 必须为空（定制商品不再被确认闸误拦）
+    assert order_exec.diff_draft(draft, fresh) == []
+
+    # 商品清单缺失 → 报错而非空清单继续
+    try:
+        optimize.reprice_draft(cli, {"storeCode": "S", "items": []})
+        assert False, "空商品清单应报错"
+    except ValueError:
+        pass
+
+
+def test_optimize_specified_coupon():
+    """--coupon 具体券：只测「无券基线+该券」；不可用时 warning 注明生效时间窗，
+    退回无券价，绝不静默枚举全量。"""
+    from src import optimize
+
+    # ① auto：枚举全部（基线 + 两张券 = 3 次 calculate-price），生效券 AAA 更便宜
+    coupon_price = {"AAA": 2000}
+    cli, calls = _quote_fake_client(coupon_price=coupon_price)
+    d = optimize.optimize(cli, "1421252", [("麦旋风", 1)])
+    assert len([c for c in calls if c[0] == "calculate-price"]) == 3
+    assert d["coupon"]["couponCode"] == "AAA" and d["price"] == 20.0
+
+    # ② 指定 AAA：只算基线 + AAA（2 次），同样命中
+    cli2, calls2 = _quote_fake_client(coupon_price=coupon_price)
+    d2 = optimize.optimize(cli2, "1421252", [("麦旋风", 1)], coupon="AAA")
+    assert len([c for c in calls2 if c[0] == "calculate-price"]) == 2
+    assert d2["coupon"]["couponCode"] == "AAA" and d2["price"] == 20.0
+
+    # ③ 指定 BBB（未生效）：算价业务失败 → warning 带生效时间窗，退回无券价
+    cli3, calls3 = _quote_fake_client(coupon_price=coupon_price)
+    d3 = optimize.optimize(cli3, "1421252", [("麦旋风", 1)], coupon="BBB")
+    assert d3["coupon"] is None and d3["price"] == 25.0
+    warns = "；".join(d3.get("pricingWarnings") or [])
+    assert "指定券" in warns and "BBB" in warns
+    assert "2026-10-20" in warns and "2026-10-25" in warns, warns  # 生效窗口可见
+
+    # ④ 指定不存在的券：不发起该券算价，warning 说明退回无券
+    cli4, calls4 = _quote_fake_client(coupon_price=coupon_price)
+    d4 = optimize.optimize(cli4, "1421252", [("麦旋风", 1)], coupon="NOT-EXIST")
+    assert len([c for c in calls4 if c[0] == "calculate-price"]) == 1
+    assert d4["coupon"] is None
+    assert any("不在卡包/门店可用券中" in w for w in d4.get("pricingWarnings") or [])
+
+
+def test_schedule_coupon_passthrough():
+    """定时触发必须把 sch['coupon'] 传进 optimize（此前只传 track，指定券被静默忽略）。"""
+    from src import schedule as sch
+    import tempfile as _tf
+
+    with _tf.TemporaryDirectory() as td:
+        tmp = Path(td)
+        sch.SCHEDULE_FILE = tmp / "schedules.json"
+        sch.OUTBOX_DIR = tmp / "outbox"
+        sch.FIRE_LOCK_FILE = tmp / ".lock"
+        order_exec.DRAFT_DIR = tmp / "drafts"
+
+        s = sch.add(kind="order", at="08:00", store="1421252", items="麦旋风 x1",
+                    coupon="BBB")
+        cli, _ = _quote_fake_client()
+        r = sch.fire(sch._NoMoneyClient(cli), s)
+        draft = json.loads(Path(r["draft"]).read_text(encoding="utf-8"))
+        # 指定券未生效 → 确认卡草稿的 warnings 必须说明原因与生效时间
+        warns = "；".join(draft.get("pricingWarnings") or [])
+        assert "指定券" in warns and "BBB" in warns and "生效" in warns, warns
+
+
+def test_auto_claim_unknown_when_query_fails():
+    """领前卡包查询失败时「本次领到」必须报未知，不得把已有卡包误报成本次领到。"""
+    from src import coupons, payloads
+
+    class FailBefore:
+        def __init__(self):
+            self.n = 0
+            self.wallet = ["c1", "c2"]   # 领前已有 2 张
+
+        def my_coupons(self):
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("query down")   # 领前查询失败
+            return {"data": {"coupons": [{"id": i} for i in self.wallet]}}
+
+        def available_coupons(self):
+            return {"data": [{"couponName": "券A", "couponStatus": "", "label": ""}]}
+
+        def call(self, name, args=None, confirm=False):
+            if name == "auto-bind-coupons":
+                return {"ok": True}
+            raise AssertionError(name)
+
+    f = FailBefore()
+    r = coupons.auto_claim(f)
+    assert r["claimedCount"] is None and r["claimedIds"] == []
+    assert any("未知" in e for e in r["errors"])
+    # 回执卡也明确显示「未知」，不是 0 也不是候选数
+    p = payloads.alert_coupon_receipt(r, "老大")
+    assert "未知" in str(p["metrics"][0]["value"])
+
+    # 领后查询失败同样报未知
+    class FailAfter(FailBefore):
+        def my_coupons(self):
+            self.n += 1
+            if self.n == 2:
+                raise RuntimeError("query down")
+            return {"data": {"coupons": [{"id": i} for i in self.wallet]}}
+    r2 = coupons.auto_claim(FailAfter())
+    assert r2["claimedCount"] is None
+
+
+def test_resolve_delivery_status_and_pair():
+    """外卖解析：休息中门店必须被过滤/拒绝；(storeCode, beCode, 地址) 三者必须校验。"""
+    from src import optimize
+
+    stores = [
+        {"storeCode": "S1", "beCode": "B1", "storeName": "休息店",
+         "businessStatus": "休息中"},
+        {"storeCode": "S2", "beCode": "B2", "storeName": "营业店",
+         "businessStatus": "营业中"},
+    ]
+
+    class C:
+        def delivery_addresses(self):
+            return {"data": {"addresses": [{"addressId": "A1", "fullAddress": "某地"}]}}
+
+        def delivery_stores(self, address_id, be_type=2):
+            return {"data": stores}
+
+    # ① 不指定门店 → 自动选第一个「营业中」的，跳过休息店
+    r = optimize.resolve_delivery(C(), "A1")
+    assert r["storeCode"] == "S2" and r["beCode"] == "B2"
+
+    # ② 指定休息中门店 → 报错而不是拿去算价
+    try:
+        optimize.resolve_delivery(C(), "A1", store_code="S1")
+        assert False, "休息中门店应被拒绝"
+    except ValueError as e:
+        assert "休息" in str(e)
+
+    # ③ 可配送门店全休息 → 明确报错
+    class CAll(C):
+        def delivery_stores(self, address_id, be_type=2):
+            return {"data": [{"storeCode": "S1", "beCode": "B1", "businessStatus": 0}]}
+    try:
+        optimize.resolve_delivery(CAll(), "A1")
+        assert False, "全部休息应报错"
+    except ValueError as e:
+        assert "休息" in str(e)
+
+    # ④ store + beCode 同给：匹配 → 通过
+    r2 = optimize.resolve_delivery(C(), "A1", store_code="S2", be_code="B2")
+    assert r2["beCode"] == "B2"
+
+    # ⑤ store + beCode 同给：beCode 与接口不一致 → 拒绝（防无效组合直送算价）
+    try:
+        optimize.resolve_delivery(C(), "A1", store_code="S2", be_code="WRONG")
+        assert False, "beCode 不一致应拒绝"
+    except ValueError as e:
+        assert "不一致" in str(e)
+
+    # ⑥ store + beCode 同给：门店不配送该地址 → 拒绝
+    try:
+        optimize.resolve_delivery(C(), "A1", store_code="S9", be_code="B9")
+        assert False, "不配送门店应拒绝"
+    except ValueError as e:
+        assert "不配送" in str(e)
+
+
+def test_dual_candidates():
+    """--track dual：同时算「全局最低」与「常买Top3」，confirm_candidates 出双动作。"""
+    from src import optimize, payloads, price_memory
+
+    cli, _ = _quote_fake_client()
+    orig_top = price_memory.top_products
+    price_memory.top_products = lambda n: [("麦旋风", 3)]
+    try:
+        res = optimize.optimize_dual(cli, "1421252", [("薯条", 1)])
+    finally:
+        price_memory.top_products = orig_top
+    assert res["global"] and res["top3"]
+    assert res["global"]["items"][0]["productCode"] == "4810"   # global 用用户点的薯条
+    assert res["top3"]["items"][0]["productCode"] == "4811"     # top3 用常买麦旋风
+
+    p = payloads.confirm_candidates(res["global"], res["top3"],
+                                    path_a="g.json", path_b="t.json")
+    assert p["type"] == "confirm"
+    ids = {a["id"] for a in p["actions"]}
+    assert ids == {"confirm_a", "confirm_b"}
+    cmds = " ".join(a.get("command", "") for a in p["actions"])
+    assert "g.json" in cmds and "t.json" in cmds and "确认下单" in cmds
+
+    # top3 轨道失败 → 降级为单候选 + warnings，不拖垮 global
+    price_memory.top_products = lambda n: [("不存在的商品", 1)]
+    try:
+        res2 = optimize.optimize_dual(cli, "1421252", [("薯条", 1)])
+    finally:
+        price_memory.top_products = orig_top
+    assert res2["global"] and res2["top3"] is None
+    assert any("Top3" in w for w in res2["warnings"])
+
 
 
 def main():
@@ -758,6 +1530,23 @@ def main():
         test_validate_payload()
         test_cancel()
         test_cancel_payload()
+        test_no_retry_on_write()
+        test_post_network_no_retry()
+        test_uncertain_order_probe()
+        test_draft_binding_hardening()
+        test_delivery_support()
+        test_timeout_to_network_error()
+        test_digest_covers_full_items()
+        test_digest_covers_request_fields()
+        test_build_argv_no_shell()
+        test_raw_readonly_gate()
+        test_lock_error_semantics()
+        test_reprice_preserves_items()
+        test_optimize_specified_coupon()
+        test_schedule_coupon_passthrough()
+        test_auto_claim_unknown_when_query_fails()
+        test_resolve_delivery_status_and_pair()
+        test_dual_candidates()
     print("ALL OFFLINE TESTS PASSED ✅")
 
 

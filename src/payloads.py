@@ -69,11 +69,15 @@ def alert_coupon_receipt(receipt: dict, nick: str = "老大") -> dict:
     """
     avail = receipt.get("available") or []
     claimable = [c for c in avail if coupons.is_claimable(c)]
-    n = int(receipt.get("claimedCount") or 0)
+    # claimedCount=None = 领前/领后卡包核验失败 → 数量未知，不能按 0 或候选数虚报
+    n_raw = receipt.get("claimedCount")
+    n_known = n_raw is not None
+    n = int(n_raw or 0)
     wallet = receipt.get("walletCount")
-    summary = (persona.on_coupons_claimed(n) if not receipt.get("errors")
+    summary = (persona.on_coupons_claimed(n) if n_known and not receipt.get("errors")
                else f"{nick}，领券过程有报错，详见明细。")
-    metrics = [{"label": "本次领到", "value": n, "unit": "张", "emphasis": True}]
+    metrics = [{"label": "本次领到", "value": n if n_known else "未知（卡包核验失败）",
+                "unit": "张", "emphasis": True}]
     if wallet is not None:
         metrics.append({"label": "卡包券数", "value": wallet, "unit": "张"})
     items = [{"name": c.get("name"), "note": c.get("label") or c.get("status") or ""}
@@ -126,6 +130,8 @@ def confirm_from_draft(draft: dict, draft_path: str = "") -> dict:
     store_line = f'{draft.get("storeName") or draft.get("storeCode")}'
     if draft.get("takeWayName"):
         store_line += f'（{draft["takeWayName"]}）'
+    if draft.get("addressText"):
+        store_line += f'　配送至 {draft["addressText"]}'
     if coupon:
         coupon_txt = coupon.get("name") or coupon.get("couponCode")
         if coupon.get("expireAt"):
@@ -139,6 +145,12 @@ def confirm_from_draft(draft: dict, draft_path: str = "") -> dict:
     ]
     if saved > 0:
         metrics.append({"label": "省", "value": saved, "unit": "元", "emphasis": True})
+    # 外卖场景：展示配送费/打包费，让用户看清总价构成
+    if draft.get("orderType") == 2 or draft.get("takeWay") == "delivery":
+        if draft.get("deliveryFee"):
+            metrics.append({"label": "配送费", "value": draft.get("deliveryFee"), "unit": "元"})
+        if draft.get("packingFee"):
+            metrics.append({"label": "打包费", "value": draft.get("packingFee"), "unit": "元"})
 
     sched = draft.get("scheduledFrom")
     if sched:
@@ -204,10 +216,18 @@ def _item_note(it: dict) -> str:
     return " · ".join(parts)
 
 
-def confirm_candidates(track_a: dict, track_b: dict) -> dict:
-    """双轨候选（全局最低 vs 常买Top3）→ confirm payload，需用户二选一。"""
-    items = []
-    for tag, d in (("全局最低", track_a), ("常买Top3", track_b)):
+def confirm_candidates(track_a: dict, track_b: dict,
+                       path_a: str = "", path_b: str = "") -> dict:
+    """双轨候选（全局最低 vs 常买Top3）→ confirm payload，需用户二选一。
+
+    path_a / path_b 提供时，为每条候选各生成一个「确认下单」动作，分别绑定
+    对应草稿文件（确认哪条就执行哪条的 order 命令）；缺省则只出候选概要，
+    由 Agent 追问用户选哪条后再出单卡确认。
+    """
+    items: list[dict] = []
+    actions: list[dict] = []
+    for tag, d, path, aid in (("全局最低", track_a, path_a, "confirm_a"),
+                              ("常买Top3", track_b, path_b, "confirm_b")):
         if not d:
             continue
         items.append({
@@ -215,11 +235,22 @@ def confirm_candidates(track_a: dict, track_b: dict) -> dict:
             "price": d.get("price"),
             "note": d.get("savingDetail", ""),
         })
+        if path:
+            actions.append({
+                "id": aid,
+                "label": f'确认{tag} ¥{d.get("price"):g}',
+                "style": "primary" if aid == "confirm_a" else "ghost",
+                "command": f'python main.py order --draft "{path}" '
+                           f'--yes --confirm-text "确认下单"',
+            })
+    if not actions:
+        actions.append({"id": "pick", "label": "选好后告诉我", "style": "primary"})
     return present.make_payload(
         "confirm", "双轨候选（请选一单）", "两条候选都算过价了，挑一条我备好下单卡。",
         metrics=[{"label": "候选", "value": len(items), "unit": "单"}],
         items=items,
-        meta={"hint": "确认哪条后，我再生成该条的草稿并等你一键确认。"},
+        actions=actions,
+        meta={"hint": "确认哪条就点哪条；未确认前我不会调用 create-order。"},
     )
 
 
@@ -231,18 +262,24 @@ _PERIOD_CN = {"today": "今天", "week": "这周", "month": "这月", "all": "�
 
 def report_from_ledger(agg: dict, nick: str = "老大") -> dict:
     period = agg.get("period", "month")
+    potential = float(agg.get("potential") or 0)
+    metrics = [
+        {"label": "实际省下", "value": agg.get("saved", 0), "unit": "元", "emphasis": True},
+        {"label": "确认订单", "value": agg.get("orders", 0), "unit": "单"},
+    ]
+    if potential > 0:
+        metrics.append({"label": "潜在优惠(未购买)", "value": potential, "unit": "元"})
+    metrics.append({"label": "抓住降价", "value": agg.get("drops", 0), "unit": "次"})
+    metrics.append({"label": "涉及门店", "value": agg.get("stores", 0), "unit": "家"})
     return present.make_payload(
         "report", f'麦麦省钱账单（{_PERIOD_CN.get(period, period)}）',
         persona.on_savings_report(agg.get("saved", 0), agg.get("drops", 0),
-                                  _PERIOD_CN.get(period, period)),
-        metrics=[
-            {"label": "累计省下", "value": agg.get("saved", 0), "unit": "元", "emphasis": True},
-            {"label": "抓住降价", "value": agg.get("drops", 0), "unit": "次"},
-            {"label": "确认订单", "value": agg.get("orders", 0), "unit": "单"},
-            {"label": "涉及门店", "value": agg.get("stores", 0), "unit": "家"},
-        ],
+                                  _PERIOD_CN.get(period, period), potential=potential),
+        metrics=metrics,
         items=agg.get("items") or [],
-        meta={"hint": "账本只记本机（~/.mcd-skill/ledger.jsonl），drop 为盯价估算、order 为真实优惠。"},
+        meta={"hint": "账本只记本机（~/.mcd-skill/ledger.jsonl）。"
+                      "「实际省下」仅含真实下单的优惠；「潜在优惠」是盯价发现的降价估算，"
+                      "尚未购买，二者不相加。"},
     )
 
 
@@ -280,7 +317,11 @@ def share_from_draft(draft: dict, drops: int = 0, saved_total: float | None = No
 # cancel：取消未支付订单（MONEY_WRITE，需人类确认闸）
 # ---------------------------------------------------------------------------
 def cancel_unpaid_preview(unpaid: list[dict], nick: str = "老大", scanned: int = 0) -> dict:
-    """未支付订单预览 → confirm payload（确认后才会逐单取消）。"""
+    """未支付订单预览 → confirm payload（确认后才会逐单取消）。
+
+    说明：order-list 无分页、只返回近期订单，故本预览只能覆盖「近期可见」范围，
+    更早的未支付单可能未被扫描到，需明确提示。
+    """
     items = []
     total = 0.0
     for o in unpaid:
@@ -296,11 +337,12 @@ def cancel_unpaid_preview(unpaid: list[dict], nick: str = "老大", scanned: int
         })
     return present.make_payload(
         "confirm", "未支付订单 · 待确认取消",
-        f'{nick}，扫到 {len(unpaid)} 单未支付订单（共 {scanned} 笔历史单），'
+        f'{nick}，近期可见的 {scanned} 笔订单中扫到 {len(unpaid)} 单未支付，'
         f'合计 ¥{total:g}。取消后不可恢复，你确认我就逐单取消。',
         metrics=[
             {"label": "未支付订单", "value": len(unpaid), "unit": "单", "emphasis": True},
             {"label": "合计金额", "value": round(total, 2), "unit": "元"},
+            {"label": "扫描范围", "value": scanned, "unit": "笔近期单"},
         ],
         items=items,
         actions=[
@@ -308,7 +350,8 @@ def cancel_unpaid_preview(unpaid: list[dict], nick: str = "老大", scanned: int
              "command": 'python main.py cancel --yes --confirm-text "确认取消"'},
             {"id": "keep", "label": "先不动", "style": "ghost"},
         ],
-        meta={"hint": "⛔ 取消不可逆。以上订单状态为「未支付」；若其中还有你要的单，先别确认。"},
+        meta={"hint": "⛔ 取消不可逆。接口仅返回近期订单，更早的未支付单可能未被覆盖，请以 App 为准；"
+                      "若其中还有你要的单，先别确认。"},
     )
 
 

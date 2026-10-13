@@ -29,13 +29,17 @@ def is_claimable(coupon: dict) -> bool:
     return True
 
 
-def _wallet_ids(client, errors: list) -> set[str]:
-    """query-my-coupons 的券 id 集合（用于领前/领后差异核验）。"""
+def _wallet_ids(client, errors: list) -> set[str] | None:
+    """query-my-coupons 的券 id 集合（用于领前/领后差异核验）。
+
+    查询失败返回 **None**（区别于「卡包为空」的空集合）——调用方不能把
+    None 当空集合做差集，否则领前失败/领后成功会把整个卡包误报成「本次领到」。
+    """
     try:
         mine = client.my_coupons()
     except Exception as e:
         errors.append(f"query-my-coupons: {e}")
-        return set()
+        return None
     d = mine.get("data") if isinstance(mine, dict) else mine
     items: list = []
     if isinstance(d, list):
@@ -90,10 +94,17 @@ def auto_claim(client) -> dict:
     except Exception as e:
         receipt["errors"].append(f"auto-bind-coupons: {e}")
 
-    # ④ 领后卡包快照 → 差集 = 本次真正领到
+    # ④ 领后卡包快照 → 差集 = 本次真正领到。
+    #    领前或领后任一次核验失败 → 数量不可信，宁报「未知」也不虚报
+    #    （领前失败+领后成功时，after-before 会把整个已有卡包误算成本次领到）。
     after = _wallet_ids(client, receipt["errors"])
-    receipt["claimedIds"] = sorted(after - before)
-    receipt["claimedCount"] = len(receipt["claimedIds"])
-    receipt["walletCount"] = len(after)
+    receipt["walletCount"] = len(after) if after is not None else None
+    if before is None or after is None:
+        receipt["claimedIds"] = []
+        receipt["claimedCount"] = None
+        receipt["errors"].append("卡包核验不完整，「本次领到」数量未知，请到 App 核对")
+    else:
+        receipt["claimedIds"] = sorted(after - before)
+        receipt["claimedCount"] = len(receipt["claimedIds"])
 
     return receipt

@@ -17,6 +17,9 @@ description: 麦麦省钱助理——你的省钱盯价闹钟。盯住麦当劳�
 
 ## 定时下单 / 到点提醒（⛔ 到点绝不自动下单）
 
+> 定位：定时任务产出**即时单**——`--at` 是触发重算价+提醒的时间，用户确认后按
+> 当下价格下单，**不做预约单**（`reservationDate` 恒为空）。要预约未来取餐请去 App。
+
 用户说「18:30 帮我下单」「到点提醒我吃饭」这类话术时：
 
 ```bash
@@ -53,9 +56,11 @@ python main.py schedule cancel <id>
 | 「麦当劳有什么优惠」「帮我盯着降价」 | `patrol` | alert |
 | 「附近有什么店」「哪家店便宜」 | `stores` | — |
 | 「看看某店菜单」 | `meals --store <code>` | — |
+| 「我想点外卖」「麦乐送送到家」 | `delivery`（查地址）→ `best --delivery --address-id <id>` | confirm |
 | 「有券吗」「能领什么券」 | `coupons`（只读预览） | alert |
 | 「帮我把券领了」 | `coupons --claim --yes`（**先复述再执行**） | alert |
 | 「X 现在多少钱」「哪个划算」 | `best --store <code> --items "X x1"` | confirm |
+| 「算外卖多少钱」「送到家多少钱」 | `best --delivery --address-id <id> --items "X x1"` | confirm |
 | 「确认下单」「就这个，下吧」 | `order --draft <刚展示的草稿> --yes` | confirm |
 | 「算了，先别买」 | 不执行任何命令 | — |
 | 「取消所有未支付订单」 | `cancel`（预览）→ `cancel --yes --confirm-text "确认取消"` | confirm/alert |
@@ -144,8 +149,16 @@ python main.py stores [--address "地址文本"]
 python main.py coupons
 python main.py coupons --claim --yes   # 真领（免费动作，留回执）
 
+# 外卖前置：查配送地址 + 可配送门店（只读）
+python main.py delivery
+python main.py delivery --address-id <地址id>
+
 # 算最优价 → confirm 确认卡（只读，产出 OrderDraft）
-python main.py best --store <storeCode> --items "商品名 x数量,..." [--track global|top3]
+python main.py best --store <storeCode> --items "商品名 x数量,..." [--track global|top3|dual]
+# --track dual=双轨候选二选一：同时算「全局最低」与「常买Top3」，出双候选确认卡，
+# 用户确认哪条就执行哪条草稿的 order 命令
+# 麦乐送外卖：自动选可配送门店，价含配送费/打包费
+python main.py best --delivery --address-id <地址id> --items "商品名 x1" [--store <code>]
 
 # 省钱账单 → report HTML 页面
 python main.py report --period today|week|month|all [--format html] [--out bill.html]
@@ -164,8 +177,8 @@ python main.py raw --tool query-my-account
 python main.py order --draft <draft.json> --yes --confirm-text "确认下单"
 # 未带 --yes 或用户未确认时，本命令拒绝执行（exit 4）。
 
-# 取消所有未支付订单（先预览，确认后才逐单取消）
-python main.py cancel                                 # 只读预览：列出所有「未支付」订单
+# 取消未支付订单（先预览，确认后才逐单取消；仅覆盖「近期可见」订单）
+python main.py cancel                                 # 只读预览：列出近期可见的「未支付」订单
 python main.py cancel --yes --confirm-text "确认取消"  # ⚠️ 逐单取消，须本人确认（exit 4 拦截）
 ```
 

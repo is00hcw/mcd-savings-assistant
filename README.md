@@ -28,7 +28,7 @@
 | 领券：显式 `--claim --yes` 才写账户，免费动作留回执 | 取消订单 / 抽奖 |
 | 算价：带券枚举，线性挑出最低到手价（积分券每单限 1 张、不叠加） | |
 | 临期积分提醒 + 常买商品 Top3 统计 | |
-| 省钱账单与战报：省 X 元 / 抓 Y 次降价，可截图分享（配方不含任何凭据） | |
+| 省钱账单与战报：实际省下 X 元（真实下单）+ 潜在优惠 Y 元（盯价估算，分开展示）+ 抓 Z 次降价，可截图分享（配方不含任何凭据） | |
 
 ## 输出形态（三层，同数据源多渲染）
 
@@ -107,6 +107,10 @@ python main.py render  --payload pay.json --format html   # 渲染层可插拔�
 
 ## 定时下单 / 到点提醒（到点只推确认消息，绝不自动下单）
 
+> 定位说明：定时任务产出的是**即时单**——`--at` 只是「触发重算价 + 提醒」的时间，
+> 到点推送确认卡，你确认后按**当下**价格下单、当下取餐。**不做预约单**
+> （草稿的 `reservationDate` 恒为空，仅兼容预留）；要预约未来取餐请到 App 操作。
+
 ```bash
 # 登记：18:30 在金环宇店买「麦旋风 x1」，自动用最优券
 python main.py schedule add --at "18:30" --store 1421252 --items "麦旋风 x1" --note "加班餐"
@@ -145,6 +149,7 @@ python main.py schedule watch           # 常驻轮询（本地调试用，生�
 | 到点客户端外壳 | `_NoMoneyClient` **默认拒绝**：只放行显白名单的只读方法，调用花钱接口/方法一律 `PermissionError`（连 `auto-bind-coupons` 也不许） |
 | 草稿确认闸 | 到点产出的草稿强制 `confirmedByHuman=false`，无用户确认执行必被拒 |
 | 确认重算价 | 下单前按草稿重新算价并比对，价格/券/商品变了就拒绝；草稿报价超 30 分钟或券已过期也拒绝；`--confirm-text` 必须精确等于「确认下单」 |
+| 写操作禁重试 | 所有写操作（下单/取消/领券/建地址）遇网络错误**不自动重试**，避免「服务端已建单但响应丢失」时重复下单；结果不确定时改查订单状态再提示用户到 App 核对 |
 
 也就是说：**即使代码将来出 bug，到点也不可能自己下单。** 而且下单那一刻若价格/券已变，同样会被拦下要求重新确认。
 
@@ -173,15 +178,17 @@ python main.py schedule watch           # 常驻轮询（本地调试用，生�
 | 「帮我盯一下降价」 | patrol | `python main.py patrol` | 盯价是持续任务，提醒用户可配定时巡检 |
 | 「附近有什么店 / 哪家店便宜」 | stores | `python main.py stores` | 地址缺失会自动从麦乐送地址推导 |
 | 「看看某店菜单」 | meals | `python main.py meals --store <门店code>` | 顺便可加 `--save` 刷新低价基线 |
+| 「我想点外卖 / 麦乐送送到家」 | delivery | `python main.py delivery` | 先查配送地址，再 `--address-id` 查可配送门店 |
 | **领券** | | | |
 | 「有券吗 / 能领什么券」 | coupons_preview | `python main.py coupons` | 默认只读预览，不动用户账户 |
 | 「帮我把券领了」 | coupons_claim | `python main.py coupons --claim --yes` | 需确认：免费动作但会写入账户，需用户明确说「领」才执行 |
 | **算价与下单** | | | |
 | 「麦旋风现在多少钱」 | best | `python main.py best --store <门店code> --items "麦旋风 x1"` | 需确认：先问清门店；算价只读，但产出的是待确认草稿 |
 | 「今天吃麦当劳哪个划算 / 最便宜」 | best | `python main.py best --store <门店code> --items "<商品> x1"` | 需确认：可加 `--track top3` 用其购买记录做个性化推荐 |
+| 「算一下外卖多少钱 / 送到家多少钱」 | best_delivery | `python main.py best --delivery --address-id <地址id> --items "<商品> x1"` | 需确认：麦乐送外卖算价（含配送费/打包费），门店可省略自动选可配送门店 |
 | 「确认下单 / 就这个，下吧」 | order | `python main.py order --draft <草稿.json> --yes --confirm-text "确认下单"` | ⚠️ 唯一允许执行花钱动作的入口；草稿必须是刚展示给用户的那份 |
 | 「算了，先别买」 | cancel | （不执行任何命令） | 礼貌收尾，不要再追问要不要下单 |
-| 「取消所有未支付订单」 | cancel_unpaid | `python main.py cancel`（预览）→ `python main.py cancel --yes --confirm-text "确认取消"` | ⚠️ 取消不可逆；先列清单，确认后才逐单取消 |
+| 「取消所有未支付订单」 | cancel_unpaid | `python main.py cancel`（预览）→ `python main.py cancel --yes --confirm-text "确认取消"` | ⚠️ 取消不可逆；仅覆盖近期可见订单，更早的未支付单需到 App 处理 |
 | **复盘与分享** | | | |
 | 「我一共省了多少钱」 | report | `python main.py report --period month` | 默认按月，可换 today/week/all |
 | 「发个战报 / 生成战报图」 | share | `python main.py share --draft <草稿.json>` | 图片用于对外转发，配方不含任何凭据 |
@@ -251,11 +258,14 @@ python main.py stores --address "深圳市南山区科技园"   # 查附近门�
 python main.py meals --store <storeCode> --save      # 看某店菜单优惠价（--save 刷新基线）
 python main.py coupons                       # 可领券预览（只读，不动账户）
 python main.py coupons --claim --yes         # 一键领券（免费写，留回执）
-python main.py best --store <code> --items "经典麦旋风 x1" [--track global|top3]
-                                             # 带券枚举算最低价，产出 confirm 确认卡（只读）
+python main.py delivery                      # 查配送地址 + 可配送门店（外卖前置，只读）
+python main.py best --store <code> --items "经典麦旋风 x1" [--track global|top3|dual]
+                                             # 到店自提：带券枚举算最低价，产出 confirm 确认卡（只读）
+python main.py best --delivery --address-id <id> --items "麦乐鸡5块 x1" [--store <code>]
+                                             # 麦乐送外卖：自动选可配送门店，价含配送费/打包费
 python main.py order --draft <draft.json> --yes --confirm-text "确认下单"
                                              # ⚠️ 红线：必须你本人确认后才执行
-python main.py cancel                         # 预览所有「未支付」订单（只读，不取消）
+python main.py cancel                         # 预览「近期可见」的未支付订单（只读，不取消）
 python main.py cancel --yes --confirm-text "确认取消"
                                              # ⚠️ 红线：逐单取消未支付订单，须本人确认
 python main.py report --period month          # 省钱账单 → HTML 页面
@@ -263,7 +273,12 @@ python main.py share --draft <draft.json>     # 省钱战报 → 图片 + 好友
 python main.py raw --tool query-my-account   # 调试：直接调任意只读工具
 ```
 
-双轨推荐：`--track global`（全菜单价格最优）/ `--track top3`（你的购买量 Top3 里挑最优）。
+轨道选择：`--track global`（全菜单价格最优，默认）/ `--track top3`（你的购买量
+Top3 里挑最优）单轨直出；`--track dual` 双轨候选二选一——两条同时算价，
+出「双轨候选」确认卡，确认哪条就执行哪条草稿的 order 命令。
+
+定时任务 `--coupon`：`auto`（默认）到点重算最优券；也可填具体券 id/code，
+到点只测「无券基线 + 该券」，该券不可用时确认卡会注明其生效时间窗并按无券价计。
 
 ## 配置说明（config.local.json）
 

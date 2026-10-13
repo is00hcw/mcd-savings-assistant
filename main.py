@@ -24,7 +24,8 @@ if sys.version_info < (3, 9):
     sys.exit(3)
 
 from src.config import get_config                      # noqa: E402
-from src.mcd_client import McdClient, McpError          # noqa: E402
+from src.mcd_client import (McdClient, McpError,          # noqa: E402
+                            READ_ONLY, FREE_WRITE, MONEY_WRITE)
 from src import (price_memory, perceive, optimize,     # noqa: E402
                  coupons as coupons_mod, order_exec, persona, payloads,
                  present, ledger, share_card, address, onboarding)
@@ -70,6 +71,7 @@ def cmd_schedule(args):
             sys.exit(1)
         print(f"✅ 已登记：{sch.describe(sch.list_all()[-1])}")
         print("⛔ 到点只会给你推确认消息，绝不会自动下单。")
+        print("（到点确认后按**当下价格**下即时单，不做预约单；--at 是触发提醒时间）")
         print("（到点触发：python main.py schedule due --fire）")
         return
 
@@ -154,10 +156,10 @@ def cmd_phrase(args):
     if args.run:
         print("→ 立即执行：")
         import subprocess
-        cmd = hit["cmd"].replace("<门店code>", args.store or "1421252")
-        cmd = cmd.replace("<商品>", args.item or "麦旋风").replace("<> x1", " x1")
-        cmd = cmd.replace("<草稿.json>", args.draft or "")
-        subprocess.run(cmd, shell=True)
+        argv = ph.build_argv(hit["cmd"], store=args.store, item=args.item,
+                             draft=args.draft,
+                             address_id=getattr(args, "address_id", ""))
+        subprocess.run(argv)  # 无 shell
 
 
 def cmd_init(args):
@@ -179,9 +181,10 @@ def cmd_init(args):
 def cmd_doctor(args):
     """首次使用自检（只读）：环境 → 配置 → Token → 地址/门店就绪 → 下一步。"""
     res = onboarding.doctor(check_token=not args.offline)
-    print(res["text"])
     if getattr(args, "format", "inline") == "json":
-        _print(res)
+        _print(res)      # json 模式：stdout 只输出一个 JSON 对象（text 已含在 res 里）
+    else:
+        print(res["text"])
     sys.exit(0 if res["ready"] else 1)
 
 
@@ -306,6 +309,49 @@ def cmd_stores(args):
     _print(_client().nearby_stores(address_text))
 
 
+def cmd_delivery(args):
+    """查配送地址 + 可配送门店（只读，外卖下单的前置步骤）。"""
+    client = _client()
+    if not args.address_id:
+        try:
+            raw = client.delivery_addresses()
+        except McpError as e:
+            print(f"[delivery] 查地址失败: {e}")
+            sys.exit(1)
+        d = raw.get("data") if isinstance(raw, dict) else raw
+        addrs = (d or {}).get("addresses") or [] if isinstance(d, dict) else []
+        if not addrs:
+            print("没有已保存的配送地址（可在麦当劳 App「麦乐送」里先存一个）。")
+            return
+        print(f"你有 {len(addrs)} 个配送地址：")
+        for a in addrs:
+            print(f"  [{a.get('addressId')}] {a.get('fullAddress')}"
+                  f"（{a.get('contactName')} {a.get('phone')}）")
+        print()
+        print("下一步查可配送门店：python main.py delivery --address-id <id>")
+        print("或直接算外卖价：python main.py best --delivery --address-id <id> --items \"麦乐鸡5块 x1\"")
+        return
+
+    try:
+        raw = client.delivery_stores(args.address_id)
+    except McpError as e:
+        print(f"[delivery] 查可配送门店失败: {e}")
+        sys.exit(1)
+    d = raw.get("data") if isinstance(raw, dict) else raw
+    stores = d if isinstance(d, list) else (d or {}).get("list") or []
+    if not stores:
+        print("该地址暂无营业中的可配送门店。")
+        return
+    print(f"该地址可配送到 {len(stores)} 家门店：")
+    for s in stores:
+        status = "营业中" if s.get("businessStatus") else "休息中"
+        print(f"  {s.get('storeName')}  storeCode={s.get('storeCode')}"
+              f"  beCode={s.get('beCode')}  [{status}]")
+    print()
+    print("下一步算外卖价：python main.py best --delivery --address-id "
+          f"{args.address_id} --store <storeCode> --items \"...\"")
+
+
 def cmd_meals(args):
     client = _client()
     raw = client.meals(args.store)
@@ -361,7 +407,7 @@ def cmd_coupons(args):
 
 
 def cmd_best(args):
-    """D 最优下单 → confirm payload（确认闸交互卡片）。"""
+    """D 最优下单 → confirm payload（确认闸交互卡片）。到店自提或麦乐送外卖。"""
     wanted = []
     for part in args.items.split(","):
         p = part.strip()
@@ -372,28 +418,82 @@ def cmd_best(args):
             wanted.append((name.strip(), int(qty or 1)))
         else:
             wanted.append((p, 1))
+    client = _client()
+    store_code = args.store
+    delivery = None
+    if args.delivery:
+        if not args.address_id:
+            print("外卖需要配送地址：先 python main.py delivery 查地址，再 --address-id <id>")
+            sys.exit(1)
+        try:
+            # --store 与 --be-code 同时指定时也必须过校验：
+            # resolve_delivery 会核对「门店确实配送该地址 + 业务码与接口一致」，
+            # 避免把无效的 (storeCode, beCode) 组合直接送给算价接口
+            resolved = optimize.resolve_delivery(
+                client, args.address_id,
+                store_code=(args.store or None),
+                be_code=args.be_code or None)
+        except (ValueError, McpError) as e:
+            print(f"[best] 外卖解析失败: {e}")
+            sys.exit(1)
+        store_code = args.store or resolved["storeCode"]
+        delivery = {"addressId": args.address_id,
+                    "beCode": args.be_code or resolved["beCode"],
+                    "addressText": resolved["addressText"]}
+    elif not store_code:
+        print("到店下单需要门店：--store <storeCode>（外卖用 --delivery --address-id <id>）")
+        sys.exit(1)
+    extra_draft_path = ""
     try:
-        draft = optimize.optimize(_client(), args.store, wanted, track=args.track)
+        if args.track == "dual":
+            # 双轨候选：同时算「全局最低」+「常买Top3」，出双候选确认卡二选一。
+            # top3 轨道失败不拖垮 global（降级为单候选确认卡并附原因）。
+            dual = optimize.optimize_dual(client, store_code, wanted, delivery=delivery)
+            if dual["top3"] is None:
+                draft = dual["global"]
+                if dual["warnings"]:
+                    draft.setdefault("pricingWarnings", []).extend(dual["warnings"])
+                path = order_exec.save_draft(draft)
+                confirm_payload = payloads.confirm_from_draft(draft, str(path))
+            else:
+                paths = {"global": str(order_exec.save_draft(dual["global"])),
+                         "top3": str(order_exec.save_draft(dual["top3"]))}
+                path = Path(paths["global"])
+                draft = dual["global"]
+                extra_draft_path = paths["top3"]
+                confirm_payload = payloads.confirm_candidates(
+                    dual["global"], dual["top3"],
+                    path_a=paths["global"], path_b=paths["top3"])
+                if dual["warnings"]:
+                    confirm_payload["meta"]["hint"] += "｜⚠️ " + "；".join(dual["warnings"])
+        else:
+            draft = optimize.optimize(client, store_code, wanted, track=args.track,
+                                      delivery=delivery)
+            path = order_exec.save_draft(draft)
+            confirm_payload = payloads.confirm_from_draft(draft, str(path))
     except (ValueError, McpError) as e:
         print(f"[best] 失败: {e}")
         sys.exit(1)
-    path = order_exec.save_draft(draft)
-    confirm_payload = payloads.confirm_from_draft(draft, str(path))
     if args.format == "json":
+        confirm_payload["draftPath"] = str(path)  # 草稿路径进 JSON，供脚本/宿主取用
+        if extra_draft_path:
+            confirm_payload["top3DraftPath"] = extra_draft_path
         text = json.dumps(confirm_payload, ensure_ascii=False, indent=2)
         if args.out:
             out = Path(args.out)
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(text, encoding="utf-8")
-            print(f"[confirm] payload 已保存: {out.resolve()}")
-            print(f"草稿: {path}")
+            # json 模式 stdout 仍只输出一个 JSON 对象（不混入文本提示）
+            print(json.dumps({"saved": True, "payloadPath": str(out.resolve()),
+                              "draftPath": str(path)}, ensure_ascii=False))
         else:
             print(text)
-            print(f"\n草稿: {path}")
         return
     _show(confirm_payload, args, out=args.out)
     if not (args.out and args.format in ("html", "svg")):
         print(f"\n订单草稿已保存: {path}")
+        if extra_draft_path:
+            print(f"双轨另一候选草稿: {extra_draft_path}")
         print(optimize.draft_to_json(draft))
 
 
@@ -440,17 +540,27 @@ def cmd_order(args):
         print(persona.blocked_by_gate())
         sys.exit(4)
     receipt = order_exec.execute_draft(client, draft)
+    if receipt.get("status") == "uncertain":
+        print("⚠️ 下单结果不确定（网络层错误），未入账本，也请不要重复执行下单：")
+        _print(receipt)
+        sys.exit(2)
+    # 到点任务下单成功 → 置 done（与「等用户确认后置 done」的状态说明一致）
+    sched = draft.get("scheduledFrom")
+    if sched and sched.get("id"):
+        from src import schedule as sch
+        sch.complete(sched["id"])
     print("下单结果（真实优惠已入账本）:")
     _print(receipt)
 
 
 def cmd_cancel(args):
-    """取消所有未支付订单（MONEY_WRITE，需 --yes --confirm-text 确认）。"""
+    """取消近期可见的未支付订单（MONEY_WRITE，需 --yes --confirm-text 确认）。"""
     from src import cancel as cancel_mod
     client = _client()
     unpaid, all_orders = cancel_mod.list_unpaid_orders(client)
     if not unpaid:
-        print(f"没有发现未支付订单（共 {len(all_orders)} 笔历史订单，均为已完结状态）。")
+        print(f"近期可见的 {len(all_orders)} 笔订单中，没有发现未支付订单（均为已完结状态）。")
+        print("（接口仅返回近期订单，更早的未支付单请到 App 查看。）")
         return
     if not args.yes:
         _show(payloads.cancel_unpaid_preview(unpaid, get_config().nickname, len(all_orders)), args)
@@ -499,8 +609,28 @@ def cmd_render(args):
     _show(payload, args, out=args.out)
 
 
+def _raw_tool_gate(tool: str) -> str | None:
+    """raw 调试入口的工具放行判定：返回拒绝原因，None = 放行。
+
+    红线：raw 只是调试通道，绝不能借它绕过「写动作需人工确认」的红线，
+    因此 FREE_WRITE（领券/建地址）与 MONEY_WRITE（下单/取消）一律拦截，
+    只放行 READ_ONLY。
+    """
+    if tool in MONEY_WRITE:
+        return f"⛔ {tool} 是花钱/花积分动作，raw 调试入口只放行只读工具。"
+    if tool in FREE_WRITE:
+        return f"⛔ {tool} 是免费写动作（会改动账户，如领券/建地址），raw 只放行只读工具。"
+    if tool not in READ_ONLY:
+        return f"⛔ {tool} 不在只读白名单中，raw 拒绝调用。"
+    return None
+
+
 def cmd_raw(args):
-    """只读调试：直接调任意只读工具。"""
+    """只读调试：仅放行 READ_ONLY 白名单工具，绝不放行写动作。"""
+    deny = _raw_tool_gate(args.tool)
+    if deny:
+        print(deny)
+        sys.exit(1)
     kwargs = json.loads(args.args) if args.args else {}
     _print(_client().call(args.tool, kwargs))
 
@@ -532,6 +662,7 @@ def main():
     p.add_argument("--store", default="", help="配合 --run 补门店 code")
     p.add_argument("--item", default="", help="配合 --run 补商品名")
     p.add_argument("--draft", default="", help="配合 --run 补草稿文件名")
+    p.add_argument("--address-id", default="", help="配合 --run 补外卖配送地址 addressId")
     p.set_defaults(fn=cmd_phrase)
 
     # ---------- G 定时执行 ----------
@@ -543,8 +674,11 @@ def main():
     a.add_argument("--kind", choices=["order", "alert"], default="order")
     a.add_argument("--store", default="", help="门店 storeCode")
     a.add_argument("--items", default="", help='"麦旋风 x1,薯条 x1"')
-    a.add_argument("--track", choices=["global", "top3"], default="global")
-    a.add_argument("--coupon", default="auto", help="auto=到点重算最优券；也可填具体券码")
+    a.add_argument("--track", choices=["global", "top3"], default="global",
+                   help="global=全菜单价格最优；top3=购买量Top3里挑（定时任务单轨）")
+    a.add_argument("--coupon", default="auto",
+                   help="auto=到点重算最优券；也可填具体券 id/code（到点只测该券，"
+                        "不可用时按无券价并注明生效时间）")
     a.add_argument("--note", default="", help="备注，如「加班餐」")
     a.add_argument("--days", type=int, default=0, help="连续重复天数，0=仅一次")
     a.add_argument("--at-alert", dest="at_alert", default="", help="alert 类型的提醒文案")
@@ -606,10 +740,19 @@ def main():
     add_fmt(p)
     p.set_defaults(fn=cmd_coupons)
 
-    p = sub.add_parser("best", help="算最优价 → confirm 确认卡（只读）")
-    p.add_argument("--store", required=True)
+    p = sub.add_parser("delivery", help="查配送地址 + 可配送门店（只读，外卖前置）")
+    p.add_argument("--address-id", default="", help="配送地址 ID；缺省则列出所有配送地址")
+    p.set_defaults(fn=cmd_delivery)
+
+    p = sub.add_parser("best", help="算最优价 → confirm 确认卡（只读；到店自提或 --delivery 麦乐送）")
+    p.add_argument("--store", default="", help="门店 storeCode（到店必填；外卖可省略自动选可配送门店）")
     p.add_argument("--items", required=True, help='"商品名或code x数量,..."')
-    p.add_argument("--track", choices=["global", "top3"], default="global")
+    p.add_argument("--track", choices=["global", "top3", "dual"], default="global",
+                   help="global=全菜单价格最优(默认)；top3=购买量Top3；"
+                        "dual=双轨候选二选一（全局最低 vs 常买Top3）")
+    p.add_argument("--delivery", action="store_true", help="麦乐送外卖（需 --address-id）")
+    p.add_argument("--address-id", default="", help="配送地址 ID（python main.py delivery 查）")
+    p.add_argument("--be-code", default="", help="业务编码（可选；缺省自动从可配送门店解析）")
     add_fmt(p)
     p.set_defaults(fn=cmd_best)
 
@@ -619,7 +762,7 @@ def main():
     p.add_argument("--confirm-text", dest="confirm_text", default="")
     p.set_defaults(fn=cmd_order)
 
-    p = sub.add_parser("cancel", help="取消所有未支付订单（红线：需 --yes --confirm-text）")
+    p = sub.add_parser("cancel", help="取消近期可见的未支付订单（红线：需 --yes --confirm-text）")
     p.add_argument("--yes", action="store_true", help="确认执行批量取消")
     p.add_argument("--confirm-text", dest="confirm_text", default="",
                    help="确认凭据，须精确等于「确认取消」")

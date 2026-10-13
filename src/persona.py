@@ -37,7 +37,11 @@ def on_meal_time() -> str:
     return f"{nick()}，到饭点了！附近店有优惠，点一下就成。"
 
 
-def on_savings_report(saved: float, drops: int, period: str = "这周") -> str:
+def on_savings_report(saved: float, drops: int, period: str = "这周",
+                      potential: float = 0.0) -> str:
+    if potential > 0:
+        return (f"{nick()}，{period}实际省下 {saved:g}，另发现 {potential:g} 的潜在优惠"
+                f"（还没买，不算数），抓了 {drops} 次降价。")
     return (f"{nick()}，{period}帮你省了 {saved:g}，抓了 {drops} 次降价，"
             f"战绩能发朋友圈了。")
 
