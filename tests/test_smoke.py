@@ -214,6 +214,33 @@ def test_config_write_whitelist():
                 cfgmod.LOCAL_CONFIG.write_text(bak, encoding="utf-8")
 
 
+def test_onboarding():
+    """首次使用引导：欢迎页 / 自检 / Agent 自述元信息。"""
+    from src import onboarding, config as cfgmod
+
+    w = onboarding.welcome()
+    assert "首次使用三步" in w and "doctor" in w and "capabilities" in w
+
+    cap = onboarding.capabilities()
+    assert cap["outputContract"]["types"] == ["alert", "confirm", "report", "share"]
+    assert len(cap["hardRules"]) >= 5
+    assert "create-order" in cap["hardRules"][0]      # 红线第一条必须是最敏感的下单
+    assert len(cap["onboarding"]["steps"]) == 3
+    assert cap["entry"]["python"].startswith("≥3.9")
+    assert onboarding.capabilities_text()          # 文本版可渲染
+
+    # 缺配置时 doctor 必须 not ready 且给出修复指引（离线，不联网）
+    with tempfile.TemporaryDirectory() as td:
+        old = cfgmod.LOCAL_CONFIG
+        cfgmod.LOCAL_CONFIG = Path(td) / "config.local.json"
+        try:
+            r = onboarding.doctor(check_token=False)
+            assert r["ready"] is False
+            assert "config.local.json" in r["text"] and "修复" in r["text"]
+        finally:
+            cfgmod.LOCAL_CONFIG = old
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -226,6 +253,7 @@ def main():
         test_ledger(tmp)
         test_address_derive()
         test_config_write_whitelist()
+        test_onboarding()
     print("ALL OFFLINE TESTS PASSED ✅")
 
 

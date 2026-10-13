@@ -27,7 +27,7 @@ from src.config import get_config                      # noqa: E402
 from src.mcd_client import McdClient, McpError          # noqa: E402
 from src import (price_memory, perceive, optimize,     # noqa: E402
                  coupons as coupons_mod, order_exec, persona, payloads,
-                 present, ledger, share_card, address)
+                 present, ledger, share_card, address, onboarding)
 
 FORMATS = ("inline", "json", "html", "svg")
 
@@ -55,6 +55,39 @@ def _show(payload: dict, args, out: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
+def cmd_init(args):
+    """一键生成 config.local.json 模板，并打印领 Token 指引。"""
+    from src import config as cfgmod
+    if cfgmod.LOCAL_CONFIG.exists() and not args.force:
+        print(f"已存在 {cfgmod.LOCAL_CONFIG}，不会覆盖（如需重建加 --force）")
+    else:
+        cfgmod.LOCAL_CONFIG.write_text(
+            cfgmod.EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"✅ 已生成配置模板：{cfgmod.LOCAL_CONFIG}")
+    print()
+    print(f"① 领 Token：手机号登录 https://open.mcd.cn/mcp → 右上角【控制台】→ 点【激活】→ 复制 Token")
+    print("② 把 Token 填进上面文件的 mcp_token 字段")
+    print("③ 自检：python main.py doctor   →   热身：python main.py warmup")
+    print("（config.local.json 已被 .gitignore 排除，Token 不会提交到仓库）")
+
+
+def cmd_doctor(args):
+    """首次使用自检（只读）：环境 → 配置 → Token → 地址/门店就绪 → 下一步。"""
+    res = onboarding.doctor(check_token=not args.offline)
+    print(res["text"])
+    if getattr(args, "format", "inline") == "json":
+        _print(res)
+    sys.exit(0 if res["ready"] else 1)
+
+
+def cmd_capabilities(args):
+    """Agent 自述元信息：我是谁 / 我会什么 / 我绝不做什么。"""
+    if getattr(args, "format", "inline") == "json":
+        _print(onboarding.capabilities())
+    else:
+        print(onboarding.capabilities_text())
+
+
 def cmd_warmup(args):
     print(persona.greeting())
     client = _client()
@@ -333,13 +366,27 @@ def sys_date():
 def main():
     ap = argparse.ArgumentParser(
         prog="mcd-skill",
-        description="麦麦省钱助理 · 你的省钱盯价闹钟（输出 alert|confirm|report|share 四型）")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+        description="麦麦省钱助理 · 你的省钱盯价闹钟（输出 alert|confirm|report|share 四型）",
+        epilog="首次使用：python main.py doctor 自检；不确定能干什么看 python main.py capabilities")
+    sub = ap.add_subparsers(dest="cmd", required=False)
 
     def add_fmt(p, default="inline"):
         p.add_argument("--format", choices=FORMATS, default=default,
                        help="渲染形态：inline 内联卡片(默认) / json 结构化 / html 页面 / svg 图片")
         p.add_argument("--out", default="", help="输出文件路径（html/svg 时生效）")
+
+    p = sub.add_parser("init", help="生成 config.local.json 模板 + 领 Token 指引")
+    p.add_argument("--force", action="store_true", help="覆盖已存在的配置")
+    p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("doctor", help="首次使用自检（只读，不下单不领券）")
+    p.add_argument("--offline", action="store_true", help="跳过 Token 连通性探测（离线可用）")
+    add_fmt(p)
+    p.set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("capabilities", help="能力清单与红线（给 Agent 读的自述元信息）")
+    add_fmt(p)
+    p.set_defaults(fn=cmd_capabilities)
 
     p = sub.add_parser("warmup", help="首启热身：导入历史订单 + 推导地址（只读，--apply 才写盘）")
     p.add_argument("--derive-address", action="store_true", help="即使已有地址也重新推导")
@@ -408,6 +455,10 @@ def main():
     p.set_defaults(fn=cmd_raw)
 
     args = ap.parse_args()
+    if not getattr(args, "cmd", None):
+        # 新用户/新会话的第一屏：给中文引导，不要 argparse usage 报错糊脸
+        print(onboarding.welcome())
+        return
     try:
         args.fn(args)
     except McpError as e:

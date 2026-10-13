@@ -53,7 +53,44 @@ python main.py render  --payload pay.json --format html   # 渲染层可插拔�
 
 设计原则：**图片只用于分享、不用于交互**——确认闸永远是卡片/按钮，绝不靠图片。
 
-## 快速开始（<2 分钟）
+## 首次使用（3 步，2 分钟）
+
+```bash
+git clone https://github.com/is00hcw/mcd-savings-assistant.git
+cd mcd-savings-assistant
+
+# ① 生成配置模板（也可以直接 cp config.example.json config.local.json）
+python main.py init
+
+# ② 填 Token：手机号登录 https://open.mcd.cn/mcp → 右上角【控制台】→【激活】→ 复制
+#    粘贴到 config.local.json 的 mcp_token 字段（仅本机，已被 .gitignore 排除）
+#    也可以改用环境变量：export MCD_MCP_TOKEN=xxx（优先级更高）
+
+# ③ 自检 → 热身 → 开始盯价
+python main.py doctor        # 全绿即配置完成（会实际验证 Token 连通性）
+python main.py warmup        # 导入历史订单，建低价档案与常买 Top3
+python main.py patrol        # 巡检常去门店：降价 / 可领券 / 临期积分
+```
+
+**忘了 Token 放哪、或不确定配好了没？** 随时跑 `python main.py doctor`：
+它会逐项检查 Python 版本、配置文件、Token 是否有效（真实调官方接口验证）、
+常用地址与常去门店是否就绪，并直接给出下一步该做什么。
+
+**不确定这个 Skill 能干什么？** 跑 `python main.py capabilities`，
+它会打印完整能力清单、输出契约和红线（也给 AI 助手读）。
+
+| 我想… | 跑这条 |
+| --- | --- |
+| 让它盯降价 | `python main.py patrol` |
+| 算某样东西今天最便宜多少 | `python main.py best --store <门店code> --items "麦旋风 x1"` |
+| 看这门技能有没有坑 | `python main.py doctor` |
+| 自动填常用地址 | `python main.py address --apply` |
+| 看我一共省了多少 | `python main.py report --period month` |
+| 生成能发朋友圈的战报 | `python main.py share --draft <草稿.json>` |
+
+> 直接在 WorkBuddy 里对话使用也可以，`skill.md` 已写好全部指令（见下方「WorkBuddy Agent Skill」）。
+
+## 快速开始（等价于上面首次使用）
 
 ```bash
 git clone <本仓库> && cd <本仓库>
