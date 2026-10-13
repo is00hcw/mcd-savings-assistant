@@ -66,6 +66,36 @@ class Config:
             gaps.append("user.delivery_address：外卖配送地址（可选）")
         return gaps
 
+    def save_user_fields(self, **fields) -> list[str]:
+        """回写 config.local.json 的 user 段（仅本地文件，已被 gitignore）。
+
+        只允许白名单键，防止误写 token 等敏感字段。
+        返回实际写入的键列表。
+        """
+        allowed = {"nickname", "default_address", "favorite_stores", "delivery_address"}
+        bad = set(fields) - allowed
+        if bad:
+            raise ValueError(f"不允许写入的字段: {bad}")
+        raw = _load_json(LOCAL_CONFIG) or {}
+        user = raw.setdefault("user", {})
+        written = []
+        for k, v in fields.items():
+            if v in (None, "", []):
+                continue
+            if user.get(k) != v:
+                user[k] = v
+                written.append(k)
+        if written:
+            LOCAL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            with open(LOCAL_CONFIG, "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=2)
+            # 刷新内存缓存
+            self.default_address = user.get("default_address") or ""
+            self.delivery_address = user.get("delivery_address") or ""
+            self.favorite_stores = user.get("favorite_stores") or []
+            self.nickname = user.get("nickname") or "老大"
+        return written
+
 
 _cache: Config | None = None
 

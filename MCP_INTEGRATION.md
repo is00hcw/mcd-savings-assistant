@@ -17,7 +17,7 @@
 | --- | --- | --- | --- |
 | `query-meals` | 菜单优惠价（currentPrice/originalPrice，**单位=元**，已实测）；`data.meals` 为 dict 且 key=code，value 可能不含 code 字段 | A/B 低价记忆、比价 | 只读 |
 | `query-meal-detail` | 套餐组成 | D 选品 | 只读 |
-| `query-nearby-stores` | 地址文本查附近门店（含预约时段） | D 定店 | 只读 |
+| `query-nearby-stores` | 地址文本查附近门店（含预约时段）。**地址缺失时由 `address.derive_addresses` 自动推导** | D 定店 | 只读 |
 | `query-my-coupons` | 卡包券（实测 `data.coupons[]`，名称字段=`title`） | A/C/D 用券 | 只读 |
 | `query-store-coupons` / `available-coupons` | 门店券 / 可领券（`couponName`/`couponStatus`） | B/C | 只读 |
 | `auto-bind-coupons` | 一键领取可领券 | C 自动领券 | 写·免费（自动，留回执） |
@@ -27,6 +27,7 @@
 | `order-list` | 近 10 笔订单（无单品价格） | A 冷启动 | 只读 |
 | `query-order` | 订单详情（`totalDiscountAmount` 判定整单有优惠） | A 冷启动佐证 | 只读 |
 | `query-my-account` | 积分（`currentMouthExpirePoint`=本月将过期） | E 提醒 | 只读 |
+| `delivery-query-addresses` | 用户在麦乐送保存的地址（`data.addresses[].fullAddress`；联系人/手机号不落盘） | 地址自动推导 | 只读 |
 | `campaign-calendar` / `now-time-info` | 月度活动 / 当前时间 | B/G | 只读 |
 | `mall-points-products` / `mall-product-detail` / `mall-create-order` | 积分商城（v2） | E | 兑换下单须确认 |
 

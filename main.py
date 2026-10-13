@@ -27,7 +27,7 @@ from src.config import get_config                      # noqa: E402
 from src.mcd_client import McdClient, McpError          # noqa: E402
 from src import (price_memory, perceive, optimize,     # noqa: E402
                  coupons as coupons_mod, order_exec, persona, payloads,
-                 present, ledger, share_card)
+                 present, ledger, share_card, address)
 
 FORMATS = ("inline", "json", "html", "svg")
 
@@ -57,7 +57,26 @@ def _show(payload: dict, args, out: str = "") -> None:
 # ---------------------------------------------------------------------------
 def cmd_warmup(args):
     print(persona.greeting())
-    result = price_memory.cold_start_from_orders(_client())
+    client = _client()
+    cfg = get_config()
+
+    # 常用地址自动推导（外卖地址为权威来源，订单门店地址兜底）
+    if not cfg.default_address or args.derive_address:
+        try:
+            derived = address.derive_addresses(client)
+            print("\n" + address.describe(derived))
+            if derived.get("primary"):
+                patch = address.to_config_patch(derived)
+                if args.apply_address:
+                    written = cfg.save_user_fields(**patch)
+                    print(f"\n[已写入 config.local.json（不进 git）] {written}")
+                else:
+                    print(f"\n[未写入] 如认可上面推导的地址，加 --apply-address 自动回填："
+                          f"python main.py warmup --apply-address")
+        except Exception as e:
+            print(f"[地址推导] 跳过: {e}")
+
+    result = price_memory.cold_start_from_orders(client)
     if result.get("error"):
         print(f"[warmup] 拉取订单失败: {result['error']}")
         return
@@ -66,11 +85,34 @@ def cmd_warmup(args):
     print(f"[warmup] 已导入 {sum(int(v.get('buyCount') or 0) for v in profile.values())} 件商品购买记录")
     print(f"[warmup] 买过优惠的商品（订单级佐证）: {len(result['discounted_names'])} 个")
     print(f"[warmup] 购买量 Top3: {top}")
+
+    # 常去门店也可从订单推导（若配置里没有）
+    if not cfg.favorite_stores:
+        scs = list(result.get("orderStores") or [])[: cfg.scan_store_limit]
+        if scs:
+            print(f"\n[建议] 从订单推导出你的常去门店: {scs}")
+            if args.apply_stores:
+                written = cfg.save_user_fields(favorite_stores=scs)
+                print(f"[已写入 config.local.json（不进 git）] {written}")
+            else:
+                print("  认可就加 --apply-stores 自动回填：python main.py warmup --apply-stores")
+
     gaps = get_config().personal_gaps()
     if gaps:
         print("\n[提醒] 以下个人信息待补充到 config.local.json（不会提交 git）:")
         for g in gaps:
             print(f"  - {g}")
+
+
+def cmd_address(args):
+    """常用地址推导（默认只读预览，不写盘）。"""
+    derived = address.derive_addresses(_client())
+    print(address.describe(derived))
+    if args.apply and derived.get("primary"):
+        written = get_config().save_user_fields(**address.to_config_patch(derived))
+        print(f"\n[已写入 config.local.json（已被 gitignore）] {written}")
+    elif derived.get("primary"):
+        print(f"\n[未写入] 认可就加 --apply：python main.py address --apply")
 
 
 def cmd_patrol(args):
@@ -102,11 +144,28 @@ def cmd_patrol(args):
 
 
 def cmd_stores(args):
-    address = args.address or get_config().default_address
-    if not address:
-        print('请提供地址：--address "..." 或在 config.local.json 填 user.default_address')
+    """查附近门店：地址优先级 = 命令行 > 配置 > 自动推导（外卖地址/门店锚点）。"""
+    cfg = get_config()
+    address_text = args.address or cfg.default_address
+    origin = "--address" if args.address else ("config" if cfg.default_address else "")
+    if not address_text:
+        try:
+            derived = address.derive_addresses(_client())
+            address_text = derived.get("primary") or (
+                (derived.get("storeAnchor") or {}).get("storeAddress") or "")
+            origin = "自动推导（外卖地址）" if derived.get("primary") else (
+                "自动推导（门店地址兜底）" if address_text else "")
+            if address_text:
+                print(f"[地址来源] {origin}：{address_text}")
+        except Exception as e:
+            print(f"[地址推导失败] {e}")
+    if not address_text:
+        print('请提供地址：--address "..."、在 config.local.json 填 user.default_address，'
+              '或先跑 python main.py address --apply')
         sys.exit(1)
-    _print(_client().nearby_stores(address))
+    if not args.address and origin == "自动推导（外卖地址）" and args.save_derived:
+        print(get_config().save_user_fields(default_address=address_text))
+    _print(_client().nearby_stores(address_text))
 
 
 def cmd_meals(args):
@@ -282,16 +341,25 @@ def main():
                        help="渲染形态：inline 内联卡片(默认) / json 结构化 / html 页面 / svg 图片")
         p.add_argument("--out", default="", help="输出文件路径（html/svg 时生效）")
 
-    p = sub.add_parser("warmup", help="首启热身：导入历史订单建低价档案（只读）")
+    p = sub.add_parser("warmup", help="首启热身：导入历史订单 + 推导地址（只读，--apply 才写盘）")
+    p.add_argument("--derive-address", action="store_true", help="即使已有地址也重新推导")
+    p.add_argument("--apply-address", action="store_true", help="把推导出的地址写入 config.local.json")
+    p.add_argument("--apply-stores", action="store_true", help="把订单里常去门店写入 config.local.json")
     p.set_defaults(fn=cmd_warmup)
+
+    p = sub.add_parser("address", help="常用地址推导（默认只读预览，--apply 回填）")
+    p.add_argument("--apply", action="store_true", help="写入 config.local.json（本地文件，不进 git）")
+    p.set_defaults(fn=cmd_address)
 
     p = sub.add_parser("patrol", help="盯价巡检 → alert 卡片（只读）")
     p.add_argument("--stores", nargs="*", help="门店 code 列表，默认用配置")
     add_fmt(p)
     p.set_defaults(fn=cmd_patrol)
 
-    p = sub.add_parser("stores", help="查附近门店（只读）")
+    p = sub.add_parser("stores", help="查附近门店（地址缺失时自动推导，只读）")
     p.add_argument("--address", default="")
+    p.add_argument("--save-derived", action="store_true",
+                   help="把自动推导的地址写入 config.local.json")
     p.set_defaults(fn=cmd_stores)
 
     p = sub.add_parser("meals", help="看某门店菜单优惠价（只读）")

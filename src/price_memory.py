@@ -92,13 +92,17 @@ def cold_start_from_orders(client) -> dict:
     """
     profile = load_profile()
     discounted: set[str] = set()
+    order_stores: list[str] = []   # 订单里出现过的门店（按频次），用于推导常去门店
     try:
         orders = client.order_list()
     except Exception as e:
-        return {"profile": profile, "discounted_names": [], "error": str(e)}
+        return {"profile": profile, "discounted_names": [], "orderStores": [], "error": str(e)}
     order_items = orders.get("data") if isinstance(orders, dict) else orders
     lst = _extract_orders(order_items)
     for od in lst:
+        sc = od.get("storeCode")
+        if sc and sc not in order_stores:
+            order_stores.append(str(sc))
         oid = od.get("orderId") or od.get("orderNo") or od.get("id")
         if not oid:
             continue
@@ -123,7 +127,8 @@ def cold_start_from_orders(client) -> dict:
             if has_discount:
                 discounted.add(key)
     save_profile(profile)
-    return {"profile": profile, "discounted_names": sorted(discounted)}
+    return {"profile": profile, "discounted_names": sorted(discounted),
+            "orderStores": order_stores}
 
 
 def _extract_orders(x):

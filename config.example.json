@@ -9,11 +9,11 @@
   "user": {
     "_comment": "称呼：AI 汇报时怎么叫你（默认：老大）",
     "nickname": "老大",
-    "_comment2": "常用地址：用于查附近门店（麦当劳 MCP 不读 GPS，只吃地址文本）",
+    "_comment2": "常用地址：可留空！跑 python main.py address --apply 会从「麦乐送已保存地址」自动推导并回填（只写本地，不进 git）",
     "default_address": "",
-    "_comment3": "常去门店 storeCode 列表（可先留空，首次使用后从收藏/历史中挑选填入）",
+    "_comment3": "常去门店 storeCode 列表（可留空，python main.py warmup --apply-stores 从订单推导）",
     "favorite_stores": [],
-    "_comment4": "外卖配送地址（可选，用于 delivery-query-stores）",
+    "_comment4": "外卖配送地址（可选，留空则同 default_address）",
     "delivery_address": ""
   },
 

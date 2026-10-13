@@ -142,6 +142,78 @@ def payloads_report(agg):
     return payloads.report_from_ledger(agg)
 
 
+def test_address_derive():
+    """常用地址推导：外卖地址为主、订单门店地址兜底、同片优先。"""
+    from src import address
+
+    class FakeClient:
+        def call(self, name, args=None):
+            if name == "delivery-query-addresses":
+                return {"data": {"addresses": [
+                    {"addressId": "1", "contactName": "黄", "phone": "155****4811",
+                     "fullAddress": "广东省深圳市宝安区西乡街道铁仔路56号 金环宇大厦办公楼907"},
+                    {"addressId": "2", "contactName": "黄", "phone": "155****4811",
+                     "fullAddress": " 水木一方大厦C栋1302"},
+                ]}}
+            raise AssertionError(name)
+
+        def order_list(self):
+            return {"data": [{"orderId": "o1", "storeCode": "1421252",
+                              "storeName": "麦当劳深圳金环宇大厦餐厅"}]}
+
+        def query_order(self, oid):
+            return {"data": {"storeAddress": "西乡街道共乐社区铁仔路56号金环宇大厦一层102号-105号铺位"}}
+
+    d = address.derive_addresses(FakeClient())
+    # 主地址应是与门店同片的金环宇那条，而非水木一方
+    assert "金环宇大厦" in d["primary"], d["primary"]
+    assert len(d["candidates"]) == 2
+    assert d["storeAnchor"]["storeCode"] == "1421252"
+    # 隐私红线：推导结果不含手机号/联系人
+    blob = json.dumps(d, ensure_ascii=False)
+    assert "155" not in blob and "contactName" not in blob
+    patch = address.to_config_patch(d)
+    assert set(patch) == {"default_address", "delivery_address"}
+
+    # 无外卖地址时退回门店锚点
+    class Empty(FakeClient):
+        def call(self, name, args=None):
+            if name == "delivery-query-addresses":
+                return {"data": {"addresses": []}}
+            raise AssertionError(name)
+    d2 = address.derive_addresses(Empty())
+    assert d2["primary"] == "" and d2["storeAnchor"]["storeCode"] == "1421252"
+
+
+def test_config_write_whitelist():
+    """回写配置只允许 user 白名单键，token 等敏感字段写不进去。"""
+    from src import config as cfgmod
+    with tempfile.TemporaryDirectory() as td:
+        bak = cfgmod.LOCAL_CONFIG.read_text(encoding="utf-8") if cfgmod.LOCAL_CONFIG.exists() else None
+        cfgmod.LOCAL_CONFIG = Path(td) / "config.local.json"
+        cfgmod.LOCAL_CONFIG.write_text(json.dumps(
+            {"mcp_token": "SECRET", "user": {"nickname": "老大"},
+             "agent": {"scan_store_limit": 3}}), encoding="utf-8")
+        try:
+            cfg = cfgmod.Config()
+            written = cfg.save_user_fields(default_address="测试地址")
+            assert written == ["default_address"]
+            assert cfg.default_address == "测试地址"
+            # token 未被动过
+            assert json.loads(cfgmod.LOCAL_CONFIG.read_text(encoding="utf-8"))["mcp_token"] == "SECRET"
+            try:
+                cfg.save_user_fields(mcp_token="hacker")
+                assert False, "白名单外的字段应被拒绝"
+            except ValueError:
+                pass
+            # 空值不覆盖已有值
+            cfg.save_user_fields(default_address="")
+            assert cfg.default_address == "测试地址"
+        finally:
+            if bak is not None:
+                cfgmod.LOCAL_CONFIG.write_text(bak, encoding="utf-8")
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -152,6 +224,8 @@ def main():
         test_recipe_and_gate(tmp)
         test_present_layers()
         test_ledger(tmp)
+        test_address_derive()
+        test_config_write_whitelist()
     print("ALL OFFLINE TESTS PASSED ✅")
 
 

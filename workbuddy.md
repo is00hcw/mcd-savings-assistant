@@ -84,6 +84,31 @@ report → HTML 账单；share → SVG 战报（二维码可扫，目视校验�
 `order` 无 `--yes` 仍按红线拒绝（exit 4）。离线测试从 5 组扩到 7 组，新增
 present 四渲染 + confirm 动作完整性 + ledger 聚合。
 
+## v0.16 增量：常用地址自动推导（省掉手填）
+
+用户问「常用地址能不能基于订单推导」。实测结论：**能，而且订单不是最佳来源**。
+
+| 来源 | 实测结果 | 定位 |
+| --- | --- | --- |
+| `delivery-query-addresses` | `data.addresses[].fullAddress`，本机有 2 条（金环宇大厦907 / 水木一方C栋1302），联系人与手机号接口本身就返回掩码 | **权威来源**，直接可喂 `query-nearby-stores` |
+| `query-order.storeAddress` | 有 `storeAddress`/`storeName`，但那是**门店**地址 | 兜底锚点，用于查周边门店 |
+| 订单本身 | 10 笔订单 `beType=1` 全是到店自取，**不含用户家地址** | 无法推导门牌 |
+
+实现（`src/address.py`）：
+
+- `derive_addresses(client)` → `{primary, candidates[], storeAnchor, notes[]}`；
+  多条地址时用 `_addr_tokens` 抽 token（行政区/建筑名，去噪）比对 storeAddress/storeName，
+  **同片优先** → 本机正确选中「金环宇大厦」那条（而非水木一方）。
+- `to_config_patch()` 只输出 `default_address`/`delivery_address`；
+  `Config.save_user_fields()` 有字段白名单，token 等敏感字段写不进去，空值不覆盖已有值。
+- CLI：`address`（默认只读预览，`--apply` 回填）、`warmup --apply-address --apply-stores`、
+  `stores` 地址缺失时自动推导并打印地址来源。
+- 隐私：手机号/联系人不落盘；地址只进 gitignore 的本地 `config.local.json`。
+
+实测：`address` 推导命中、`stores` 无配置地址自动查到门店、`--apply` 回填后
+`warmup` 不再提示补地址。离线测试 7 组→9 组（新增推导逻辑与回写白名单，含
+「推导结果不含手机号」「敏感字段写不进」「空值不覆盖」断言）。全程只读，未下单未领券。
+
 ## 设计取舍
 
 - **零第三方依赖**：QR 码自研（v1–5 单块）换取 clone 即用；配方 JSON 压缩到 106 字节内。

@@ -81,12 +81,33 @@ python main.py raw --tool query-my-account   # 调试：直接调任意只读工
 | --- | --- |
 | `mcp_token` | 麦当劳 MCP Token（也可用环境变量 `MCD_MCP_TOKEN`，优先级更高）。领取：open.mcd.cn/mcp 手机号登录 → 控制台激活 |
 | `user.nickname` | AI 怎么称呼你（默认「老大」，可改 老板/哥/靓仔） |
-| `user.default_address` | 常用地址文本（MCP 不读 GPS，只吃地址） |
-| `user.favorite_stores` | 常去门店 storeCode 列表（巡检范围） |
+| `user.default_address` | 常用地址文本（MCP 不读 GPS，只吃地址）。**可自动推导**，见下节 |
+| `user.favorite_stores` | 常去门店 storeCode 列表（巡检范围），也可从订单推导 |
 | `user.delivery_address` | 外卖配送地址（可选） |
 | `agent.*` | 巡检门店数上限 / 新低阈值 / 临期积分阈值 |
 
-本地数据（低价基线、菜单快照、商品档案）只存在 `~/.mcd-skill/`，**不收集、不上传**。
+本地数据（低价基线、菜单快照、商品档案、省钱账本）只存在 `~/.mcd-skill/`，**不收集、不上传**。
+
+## 个人信息不用手填：自动推导
+
+```bash
+python main.py address                 # 只读预览推导结果（不写盘）
+python main.py address --apply         # 认可就回填到 config.local.json（本地文件，不进 git）
+python main.py warmup --apply-address --apply-stores   # 首启一并回填地址 + 常去门店
+```
+
+推导优先级：
+
+1. **`delivery-query-addresses`（权威）**——你自己在麦乐送保存的地址，直接可喂给
+   `query-nearby-stores`；多条时选与常去门店**同片**的那条（比对地址/门店名 token）。
+2. **订单 `storeAddress`（兜底）**——订单只能推**门店**地址，推不出你家门牌，
+   但可作为「查周边门店」的锚点。
+3. 都拿不到才需要你手填。
+
+隐私红线：手机号与联系人**一律不落盘**（接口本身返回的也是掩码号）；回写函数有字段白名单，
+`mcp_token` 之类敏感字段写不进去；地址只进 gitignore 的本地文件。
+
+`stores` 命令在地址缺失时会自动用推导结果查店（并打印地址来源），无需先手工配置。
 
 ## WorkBuddy Agent Skill
 

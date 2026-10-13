@@ -47,6 +47,9 @@ CLI 的一切输出都是**结构化 payload**，带 `type` 字段：
 ```bash
 # 首启热身：导入历史订单，建低价档案与商品偏好（只读）
 python main.py warmup
+# 自动推导常用地址与常去门店（默认只读预览；--apply* 才写本地配置，不进 git）
+python main.py address [--apply]
+python main.py warmup --apply-address --apply-stores
 
 # 盯价巡检 → alert 卡片（只读）
 python main.py patrol [--stores 1421252 1421089] [--format inline|json]
@@ -54,8 +57,8 @@ python main.py patrol [--stores 1421252 1421089] [--format inline|json]
 # 看某门店菜单优惠价（只读）
 python main.py meals --store <storeCode> [--save]
 
-# 查附近门店（只读）
-python main.py stores --address "地址文本"
+# 查附近门店（只读；地址缺失时自动从麦乐送地址推导）
+python main.py stores [--address "地址文本"]
 
 # 可领券预览（默认只读，不动账户）
 python main.py coupons
