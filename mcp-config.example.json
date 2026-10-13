@@ -1,0 +1,11 @@
+{
+  "_comment": "WorkBuddy / MCP 客户端接入示例。真实 token 请放在本机的 config.local.json 或环境变量 MCD_MCP_TOKEN 中，切勿写入本文件提交。",
+  "mcpServers": {
+    "mcd": {
+      "url": "https://mcp.mcd.cn",
+      "headers": {
+        "Authorization": "Bearer YOUR_MCP_TOKEN"
+      }
+    }
+  }
+}

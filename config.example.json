@@ -1,0 +1,28 @@
+{
+  "_comment": "复制本文件为 config.local.json 并填入你自己的信息。config.local.json 已被 .gitignore 排除，永远不会提交到 GitHub。所有字段含义见 README.md「配置」一节。",
+  "_how_to_get_token": "打开 https://open.mcd.cn/mcp 用手机号登录 → 控制台激活（免费）→ 复制你的 MCP Token 填到 mcp_token 字段。也可不改本文件，改用环境变量 MCD_MCP_TOKEN。",
+
+  "mcp_token": "YOUR_MCP_TOKEN",
+
+  "_personal_hint": "以下为个人信息，请按需填写；留空的字段程序会用交互式提问或临时参数兜底。",
+
+  "user": {
+    "_comment": "称呼：AI 汇报时怎么叫你（默认：老大）",
+    "nickname": "老大",
+    "_comment2": "常用地址：用于查附近门店（麦当劳 MCP 不读 GPS，只吃地址文本）",
+    "default_address": "",
+    "_comment3": "常去门店 storeCode 列表（可先留空，首次使用后从收藏/历史中挑选填入）",
+    "favorite_stores": [],
+    "_comment4": "外卖配送地址（可选，用于 delivery-query-stores）",
+    "delivery_address": ""
+  },
+
+  "agent": {
+    "_comment": "巡检默认门店数量上限（控频保护，600 次/分钟限流）",
+    "scan_store_limit": 3,
+    "_comment": "降价事件阈值：当前价低于历史最低的该比例才播报（0.98 = 新低才算）",
+    "new_low_ratio": 1.0,
+    "_comment": "临期积分提醒阈值（分）",
+    "expire_points_threshold": 100
+  }
+}

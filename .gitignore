@@ -1,0 +1,22 @@
+# ===== 机密与个人信息：严禁提交 =====
+config.local.json
+*.local.json
+.env
+*.env
+
+# ===== 本地缓存数据 =====
+data/
+.mcd-skill/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== 编辑器/系统 =====
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
