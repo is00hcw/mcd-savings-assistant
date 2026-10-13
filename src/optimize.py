@@ -26,13 +26,50 @@ def build_items(client, store_code: str, wanted: list[tuple[str, int]]) -> list[
             key = normalize_name(name_or_code)
             code = menu_codes.get(key)
             if not code:
-                raise ValueError(f"门店 {store_code} 菜单中找不到商品: {name_or_code}")
-            label = (menu.get(key) or {}).get("name") or name_or_code
+                # 模糊兜底：用户常说简称（"麦旋风" → 优先命中他买过的那款）
+                key2, cand = _fuzzy_menu_key(key, menu)
+                if key2:
+                    code, label = menu_codes[key2], (menu.get(key2) or {}).get("name")
+                elif len(cand) == 1:
+                    key2 = cand[0]
+                    code, label = menu_codes[key2], (menu.get(key2) or {}).get("name")
+                else:
+                    tip = ("；该店相近商品：" + "、".join(
+                        (menu.get(c) or {}).get("name", c) for c in cand[:6])) if cand else ""
+                    raise ValueError(
+                        f"门店 {store_code} 菜单中找不到商品: {name_or_code}{tip}")
+            else:
+                label = (menu.get(key) or {}).get("name") or name_or_code
         item = {"productCode": code, "quantity": int(qty)}
         if label:
             item["name"] = label
         items.append(item)
     return items
+
+
+def _fuzzy_menu_key(key: str, menu: dict[str, dict],
+                    profile: dict | None = None) -> tuple[str, list[str]]:
+    """简称兜底排序规则（按优先级）：
+
+    1. **买过的优先**——用户历史订单里买过的款（buyCount 降序），
+       避免他常点的「麦旋风任选」被陌生的「蓝莓爆爆珠麦旋风」抢走；
+    2. 其次取**最短**的包含匹配（最贴近用户口中的通用名）；
+    3. 仍无解时报错并列出相近商品，让用户改口。
+    """
+    if not key:
+        return "", []
+    profile = profile if profile is not None else price_memory.load_profile()
+    cands = [k for k in menu if k and (k in key or key in k)]
+    if not cands:
+        return "", []
+
+    def rank(k: str) -> tuple:
+        bought = int((profile.get(k) or {}).get("buyCount") or 0)
+        contains_query = 0 if key in k else 1     # 菜单名含用户输入的优先
+        return (0 if bought > 0 else 1, -bought, contains_query, len(k), k)
+
+    ordered = sorted(cands, key=rank)
+    return ordered[0], ordered
 
 
 def _menu_index(client, store_code: str) -> dict[str, dict]:

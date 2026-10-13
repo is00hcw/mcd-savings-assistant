@@ -276,6 +276,113 @@ def test_phrases():
     assert len(ph.cases()) == len(ph.PHRASES)
 
 
+def test_schedule():
+    """G 定时执行：到点只推送确认消息，绝不自动下单。"""
+    from src import schedule as sch
+    import tempfile as _tf
+
+    # 时间解析
+    assert sch.parse_at("18:30")["time"] == "18:30:00"
+    assert sch.parse_at("2026-10-13 07:05")["date"] == "2026-10-13"
+    for bad in ("25:00", "abc", "18:99", ""):
+        try:
+            sch.parse_at(bad)
+            assert False, f"非法时间应被拒绝: {bad}"
+        except ValueError:
+            pass
+
+    with _tf.TemporaryDirectory() as td:
+        tmp = Path(td)
+        sch.SCHEDULE_FILE = tmp / "schedules.json"
+        sch.OUTBOX_DIR = tmp / "outbox"
+        order_exec.DRAFT_DIR = tmp / "drafts"
+
+        s = sch.add(kind="order", at="08:00", store="1421252", items="麦旋风 x1", note="早餐")
+        assert s["status"] == "pending"
+        assert len(sch.list_all(only_pending=True)) == 1
+
+        # 未到点不触发
+        from datetime import datetime
+        assert sch.due(now=datetime(2026, 10, 13, 7, 59)) == []
+        due_list = sch.due(now=datetime(2026, 10, 13, 8, 1))
+        assert len(due_list) == 1
+
+        # 红线：到点客户端禁止一切写/花钱调用
+        from src.mcd_client import McdClient, McpError
+        guard = sch._NoMoneyClient(McdClient("x"))
+        for money in ("create-order", "mall-create-order", "cancel-order", "draw-lottery"):
+            try:
+                guard.call(money, {}, confirm=True)
+                assert False, f"{money} 应被到点阶段拦截"
+            except PermissionError:
+                pass
+        try:
+            guard.call("auto-bind-coupons", {})     # 连免费写操作也不许
+            assert False, "auto-bind-coupons 应被拦截"
+        except PermissionError:
+            pass
+
+        # fire：只重算价 + 推确认卡，产出 confirmedByHuman=False
+        class FakeClient:
+            def call(self, name, args=None, confirm=False):
+                assert confirm is False, "到点阶段不允许带 confirm 调用"
+                if name == "query-meals":
+                    return {"data": {"meals": {"111": {"name": "经典麦旋风", "code": "111",
+                                                       "currentPrice": 15.5, "originalPrice": 15.5}}}}
+                if name in ("query-my-coupons", "query-store-coupons"):
+                    return {"data": {"coupons": [], "list": []}}
+                if name == "calculate-price":
+                    return {"data": {"price": 1550, "originalPrice": 1550, "discount": 0,
+                                     "takeWayList": [{"code": "eat-in", "title": "堂食"}],
+                                     "storeName": "测试店"}}
+                raise AssertionError(f"到点阶段不应调用 {name}")
+
+            # 只读便捷方法（与真实 McdClient 同名）
+            def meals(self, store_code, **kw):
+                return self.call("query-meals", kw or {})
+
+            def my_coupons(self):
+                return self.call("query-my-coupons")
+
+            def store_coupons(self, store_code):
+                return self.call("query-store-coupons")
+
+        r = sch.fire(FakeClient(), s)
+        assert r["payload"]["type"] == "confirm"
+        assert "不会自动下单" in r["payload"]["meta"]["hint"]
+        assert Path(r["json"]).exists() and Path(r["html"]).exists()
+        draft = json.loads(Path(r["draft"]).read_text(encoding="utf-8"))
+        assert draft["confirmedByHuman"] is False          # ← 未获用户确认
+        assert draft["scheduledFrom"]["id"] == s["id"]
+        assert r["readOnlyCalls"] and "create-order" not in r["readOnlyCalls"]
+        # 触发后状态变为 fired（等用户确认）
+        assert sch.list_all()[0]["status"] == "fired"
+        assert sch.due(now=datetime(2026, 10, 13, 9, 0)) == []   # 不会重复触发
+
+        assert sch.cancel(s["id"]) and sch.list_all()[0]["status"] == "cancelled"
+
+
+def test_fuzzy_prefers_bought():
+    """模糊匹配优先命中买过的商品（用户只说简称时的正确预期）。"""
+    from src import optimize, price_memory
+    menu = {
+        "经典麦旋风": {"name": "经典麦旋风"},
+        "蓝莓爆爆珠麦旋风": {"name": "蓝莓爆爆珠麦旋风"},
+        "派": {"name": "派"},
+        "姜汁撞奶风味派": {"name": "姜汁撞奶风味派"},
+    }
+    profile = {"姜汁撞奶风味派": {"buyCount": 2}, "蓝莓爆爆珠麦旋风": {"buyCount": 1}}
+    # 买过的优先：用户说「派」应命中他常买的姜汁撞奶风味派，而不是泛指的「派」
+    k, cands = optimize._fuzzy_menu_key("派", menu, profile)
+    assert menu[k]["name"] == "姜汁撞奶风味派"
+    # 无购买记录时才退化为最短包含匹配
+    k2, _ = optimize._fuzzy_menu_key("麦旋风", menu, {})
+    assert menu[k2]["name"] == "经典麦旋风"
+    # 完全不沾边 → 无候选，由上层报错并列相近商品
+    k3, c3 = optimize._fuzzy_menu_key("双人晚餐", menu, profile)
+    assert k3 == "" and c3 == []
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -290,6 +397,8 @@ def main():
         test_config_write_whitelist()
         test_onboarding()
         test_phrases()
+        test_schedule()
+        test_fuzzy_prefers_bought()
     print("ALL OFFLINE TESTS PASSED ✅")
 
 

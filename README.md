@@ -53,6 +53,57 @@ python main.py render  --payload pay.json --format html   # 渲染层可插拔�
 
 设计原则：**图片只用于分享、不用于交互**——确认闸永远是卡片/按钮，绝不靠图片。
 
+## 定时下单 / 到点提醒（到点只推确认消息，绝不自动下单）
+
+```bash
+# 登记：18:30 在金环宇店买「麦旋风 x1」，自动用最优券
+python main.py schedule add --at "18:30" --store 1421252 --items "麦旋风 x1" --note "加班餐"
+
+# 到点了 / 让定时任务替你问一遍（到点时刻该命令由系统计划任务或 WorkBuddy 定时任务调用）
+python main.py schedule due --fire
+
+# 其他管理
+python main.py schedule list            # 查看全部（--pending 只看未触发）
+python main.py schedule cancel <id>     # 取消（保留记录）
+python main.py schedule rm <id>         # 删除
+python main.py schedule watch           # 常驻轮询（本地调试用，生产建议交给定时任务）
+```
+
+**到点会发生什么**（严格三步，绝不越过）：
+
+1. **重新算价**——用**此刻**的菜单价与券重新算（券可能过期、特价可能已结束）；
+2. **推送确认消息**——生成 confirm 确认卡（原价/到手价/省多少/用的哪张券），
+   落盘到 `~/.mcd-skill/outbox/`，并在消息里附上确认后才执行的命令；
+3. **停下等你**——你回「确认下单」后才走 `order --yes` 真正下单。
+
+```
+⏰ 到点任务 1 条
+--- 推送内容 ---
+🧾 到点了：加班餐
+老大，18:30 的单我算好了：原价 16.5，到手 14.5，省 2.0。（价格与券已按此刻重新计算）
+你确认我就下，不确认我不动。
+⛔ 这条只是确认消息，我不会自动下单。
+```
+
+**三重保险**（不是靠自觉，是靠机制）：
+
+| 防线 | 实现 |
+| --- | --- |
+| 客户端白名单 | `create-order` 等花钱工具无 `confirm=True` 直接拒绝 |
+| 到点客户端外壳 | `_NoMoneyClient` **默认拒绝**：只放行显白名单的只读方法，调用花钱接口/方法一律 `PermissionError`（连 `auto-bind-coupons` 也不许） |
+| 草稿确认闸 | 到点产出的草稿强制 `confirmedByHuman=false`，无用户确认执行必被拒 |
+
+也就是说：**即使代码将来出 bug，到点也不可能自己下单。**
+
+配合系统定时任务（Windows 任务计划 / cron）：
+
+```bash
+*/10 * * * * cd /path/to/mcd-savings-assistant && python main.py schedule due --fire
+```
+
+在 WorkBuddy 里也可以让我建一个定时任务，每 10 分钟跑一次 `schedule due --fire`，
+到点有单子我就把确认卡推给你。
+
 ## 常用话术（照着说就行 · 同时也是验收用例）
 
 在 WorkBuddy 里直接说人话即可；纯 CLI 玩法可以先查映射：

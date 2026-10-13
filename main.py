@@ -55,6 +55,81 @@ def _show(payload: dict, args, out: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
+def cmd_schedule(args):
+    """G 定时执行：登记 / 查看 / 到点触发（只推送确认消息，不自动下单）。"""
+    from src import schedule as sch
+
+    act = args.action
+    if act == "add":
+        try:
+            sch.add(kind=args.kind, at=args.at, store=args.store or "",
+                    items=args.items or "", track=args.track,
+                    coupon=args.coupon, note=args.note, days=args.days)
+        except ValueError as e:
+            print(f"[schedule] {e}")
+            sys.exit(1)
+        print(f"✅ 已登记：{sch.describe(sch.list_all()[-1])}")
+        print("⛔ 到点只会给你推确认消息，绝不会自动下单。")
+        print("（到点触发：python main.py schedule due --fire）")
+        return
+
+    if act == "list":
+        items = sch.list_all(only_pending=args.pending)
+        if not items:
+            print("还没有定时任务。例：python main.py schedule add --at 18:30 "
+                  "--store 1421252 --items \"麦旋风 x1\" --note \"加班餐\"")
+            return
+        print(f"共 {len(items)} 条：")
+        for s in items:
+            print("  " + sch.describe(s))
+        return
+
+    if act in ("rm", "cancel"):
+        ok = sch.remove(args.id) if act == "rm" else sch.cancel(args.id)
+        print(("已删除" if ok else "未找到该任务") + f"：{args.id}")
+        return
+
+    if act == "due":
+        pend = sch.due()
+        if not pend:
+            print("暂无到点任务。（提示：schedule watch 可常驻轮询）")
+            return
+        print(f"⏰ 到点任务 {len(pend)} 条：")
+        for s in pend:
+            print("  " + sch.describe(s))
+        if not args.fire:
+            print("加 --fire 才会重新算价并推送确认消息（仍不会自动下单）。")
+            return
+        client = _client()
+        for s in pend:
+            try:
+                r = sch.fire(client, s)
+            except Exception as e:
+                print(f"  ❌ {s['id']} 触发失败：{e}")
+                continue
+            print()
+            print(f"--- 推送内容（{s['id']}）---")
+            print(present.render_inline(r["payload"]))
+            print(f"确认卡已落盘：{r['html']}")
+            if r["draft"]:
+                print(f"要下单请回复「确认下单」，执行："
+                      f'python main.py order --draft "{r["draft"]}" --yes --confirm-text "确认下单"')
+        return
+
+    if act == "watch":
+        import time as _t
+        print(f"轮询中：每 {args.interval}s 检查一次到点任务（Ctrl+C 退出）")
+        print("提醒：生产环境建议用系统计划任务/WorkBuddy 定时任务调 schedule due --fire")
+        try:
+            while True:
+                if sch.due():
+                    cmd_schedule(argparse.Namespace(
+                        action="due", fire=True, pending=False, id=None, interval=None))
+                _t.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("\n已停止轮询。")
+
+
 def cmd_phrase(args):
     """话术 → 命令映射：给新用户「照着说」，也给 Agent 查映射表。
 
@@ -416,6 +491,37 @@ def main():
     p.add_argument("--item", default="", help="配合 --run 补商品名")
     p.add_argument("--draft", default="", help="配合 --run 补草稿文件名")
     p.set_defaults(fn=cmd_phrase)
+
+    # ---------- G 定时执行 ----------
+    sp = sub.add_parser("schedule", help="定时下单/到点提醒（到点只推确认消息，绝不自动下单）")
+    ssub = sp.add_subparsers(dest="action", required=True)
+
+    a = ssub.add_parser("add", help="登记定时任务")
+    a.add_argument("--at", required=True, help='"18:30" 或 "2026-10-13 18:30"')
+    a.add_argument("--kind", choices=["order", "alert"], default="order")
+    a.add_argument("--store", default="", help="门店 storeCode")
+    a.add_argument("--items", default="", help='"麦旋风 x1,薯条 x1"')
+    a.add_argument("--track", choices=["global", "top3"], default="global")
+    a.add_argument("--coupon", default="auto", help="auto=到点重算最优券；也可填具体券码")
+    a.add_argument("--note", default="", help="备注，如「加班餐」")
+    a.add_argument("--days", type=int, default=0, help="连续重复天数，0=仅一次")
+    a.add_argument("--at-alert", dest="at_alert", default="", help="alert 类型的提醒文案")
+
+    a = ssub.add_parser("list", help="列出所有定时任务")
+    a.add_argument("--pending", action="store_true", help="只看未触发")
+
+    a = ssub.add_parser("rm", help="删除任务")
+    a.add_argument("id")
+    a = ssub.add_parser("cancel", help="取消任务（保留记录）")
+    a.add_argument("id")
+
+    a = ssub.add_parser("due", help="检查到点任务")
+    a.add_argument("--fire", action="store_true", help="到点则重算价并推送确认消息（不下单）")
+
+    a = ssub.add_parser("watch", help="常驻轮询到点任务（Ctrl+C 退出）")
+    a.add_argument("--interval", type=int, default=60, help="轮询间隔秒")
+
+    sp.set_defaults(fn=cmd_schedule)
 
     p = sub.add_parser("doctor", help="首次使用自检（只读，不下单不领券）")
     p.add_argument("--offline", action="store_true", help="跳过 Token 连通性探测（离线可用）")
