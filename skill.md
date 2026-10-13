@@ -15,6 +15,30 @@ description: 麦麦省钱助理——你的省钱盯价闹钟。盯住麦当劳�
 2. **工作目录**：切到本 skill 所在目录执行。
 3. **配置**：token 从环境变量 `MCD_MCP_TOKEN` 或本目录 `config.local.json` 读取（后者优先）。
 
+## 常用话术映射（用户这么说 → 你跑哪条）
+
+拿不准用户意图时跑 `python main.py phrase "<用户原话>"`，它会给出意图、命令与说明；
+`python main.py phrase`（无参数）打印完整话术表。核心映射：
+
+| 用户说 | 你执行 | 输出 type |
+| --- | --- | --- |
+| 「麦当劳有什么优惠」「帮我盯着降价」 | `patrol` | alert |
+| 「附近有什么店」「哪家店便宜」 | `stores` | — |
+| 「看看某店菜单」 | `meals --store <code>` | — |
+| 「有券吗」「能领什么券」 | `coupons`（只读预览） | alert |
+| 「帮我把券领了」 | `coupons --claim --yes`（**先复述再执行**） | alert |
+| 「X 现在多少钱」「哪个划算」 | `best --store <code> --items "X x1"` | confirm |
+| 「确认下单」「就这个，下吧」 | `order --draft <刚展示的草稿> --yes` | confirm |
+| 「算了，先别买」 | 不执行任何命令 | — |
+| 「我一共省了多少钱」 | `report --period month` | report |
+| 「发个战报」 | `share --draft <草稿>` | share |
+| 「怎么用你」「你好」 | `capabilities` / `doctor` | — |
+| 「帮我填好地址」 | `address --apply`（**先给他看推导结果**） | alert |
+
+⚠️ 三条红线话术：**「确认下单」必须绑定刚展示过的那份草稿**；
+**「领券」「填地址」会写入账户，先复述一遍再执行**；
+**「算了」立即停手，不再追问**。
+
 ## 首次使用引导（Agent 必读）
 
 **每次新会话开始，先判断用户是不是第一次用**，按下面走：

@@ -241,6 +241,41 @@ def test_onboarding():
             cfgmod.LOCAL_CONFIG = old
 
 
+def test_phrases():
+    """常用话术映射 = 验收测试用例：话术 → 意图 / 类型 / 是否可自动执行。"""
+    from src import phrases as ph
+
+    cases = [
+        ("麦当劳今天有啥优惠", "patrol"), ("帮我盯着降价", "patrol"),
+        ("附近有店吗", "stores"), ("看看某店菜单", "meals"),
+        ("有券吗", "coupons_preview"), ("帮我把券领了", "coupons_claim"),
+        ("麦旋风现在多少钱", "best"), ("今天吃麦当劳哪个划算", "best"),
+        ("确认下单", "order"), ("算了先别买", "cancel"),
+        ("我一共省了多少钱", "report"), ("发个战报", "share"),
+        ("怎么用你", "doctor"), ("你好，你会干嘛", "capabilities"),
+    ]
+    for say, expect in cases:
+        hit = ph.match(say)
+        assert hit is not None, f"未匹配: {say}"
+        assert hit["intent"] == expect, f"「{say}」→ {hit['intent']}，期望 {expect}"
+
+    # 红线：花钱/写入类意图一律不可自动执行
+    assert ph.runnable("patrol") and ph.runnable("report")
+    for danger in ("order", "coupons_claim", "address"):
+        assert ph.runnable(danger) is False, f"{danger} 不应可自动执行"
+
+    # 话术表可渲染，且覆盖 PHRASES 全量条目
+    md = ph.table_markdown()
+    for it in ph.PHRASES:
+        assert it["phrase"] in md, f"话术表缺少: {it['phrase']}"
+    assert "⚠️" in md          # 下单条目必须带危险标记
+    assert md.count("需确认：") >= 3
+    # 每条话术的渲染类型必须是合法 payload type
+    for it in ph.PHRASES:
+        assert it["type"] in (None, "alert", "confirm", "report", "share"), it
+    assert len(ph.cases()) == len(ph.PHRASES)
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -254,6 +289,7 @@ def main():
         test_address_derive()
         test_config_write_whitelist()
         test_onboarding()
+        test_phrases()
     print("ALL OFFLINE TESTS PASSED ✅")
 
 

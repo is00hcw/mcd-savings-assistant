@@ -53,6 +53,39 @@ python main.py render  --payload pay.json --format html   # 渲染层可插拔�
 
 设计原则：**图片只用于分享、不用于交互**——确认闸永远是卡片/按钮，绝不靠图片。
 
+## 常用话术（照着说就行 · 同时也是验收用例）
+
+在 WorkBuddy 里直接说人话即可；纯 CLI 玩法可以先查映射：
+`python main.py phrase "麦当劳有什么优惠"`。
+
+| 你可以这样说 | 它会做什么 | 执行的命令 | 备注 |
+| --- | --- | --- | --- |
+| **打招呼与自检** | | | |
+| 「你好，你会干嘛」 | capabilities | `python main.py capabilities` | 先讲清能做什么与红线，别急着要 Token |
+| 「怎么用你 / 第一次用」 | doctor | `python main.py doctor` | 自检 8 项并给出下一步 |
+| 「检查一下配置 / 能用吗」 | doctor | `python main.py doctor` | 会真实验证 Token 连通性 |
+| **盯价与选店** | | | |
+| 「麦当劳有什么优惠」 | patrol | `python main.py patrol` | 最常用的一句话，等价于「帮我巡检一遍」 |
+| 「帮我盯一下降价」 | patrol | `python main.py patrol` | 盯价是持续任务，提醒用户可配定时巡检 |
+| 「附近有什么店 / 哪家店便宜」 | stores | `python main.py stores` | 地址缺失会自动从麦乐送地址推导 |
+| 「看看某店菜单」 | meals | `python main.py meals --store <门店code>` | 顺便可加 `--save` 刷新低价基线 |
+| **领券** | | | |
+| 「有券吗 / 能领什么券」 | coupons_preview | `python main.py coupons` | 默认只读预览，不动用户账户 |
+| 「帮我把券领了」 | coupons_claim | `python main.py coupons --claim --yes` | 需确认：免费动作但会写入账户，需用户明确说「领」才执行 |
+| **算价与下单** | | | |
+| 「麦旋风现在多少钱」 | best | `python main.py best --store <门店code> --items "麦旋风 x1"` | 需确认：先问清门店；算价只读，但产出的是待确认草稿 |
+| 「今天吃麦当劳哪个划算 / 最便宜」 | best | `python main.py best --store <门店code> --items "<商品> x1"` | 需确认：可加 `--track top3` 用其购买记录做个性化推荐 |
+| 「确认下单 / 就这个，下吧」 | order | `python main.py order --draft <草稿.json> --yes --confirm-text "确认下单"` | ⚠️ 唯一允许执行花钱动作的入口；草稿必须是刚展示给用户的那份 |
+| 「算了，先别买」 | cancel | （不执行任何命令） | 礼貌收尾，不要再追问要不要下单 |
+| **复盘与分享** | | | |
+| 「我一共省了多少钱」 | report | `python main.py report --period month` | 默认按月，可换 today/week/all |
+| 「发个战报 / 生成战报图」 | share | `python main.py share --draft <草稿.json>` | 图片用于对外转发，配方不含任何凭据 |
+| **配置与地址** | | | |
+| 「帮我填好地址 / 我的地址在哪」 | address | `python main.py address --apply` | 需确认：从麦乐送已存地址推导；写入前先给用户看推导结果 |
+
+想看机器可读的验收用例：`python main.py phrase`（话术表）、
+`python -c "from src.phrases import cases; print(cases())"`（结构化用例）。
+
 ## 首次使用（3 步，2 分钟）
 
 ```bash

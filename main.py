@@ -55,6 +55,36 @@ def _show(payload: dict, args, out: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
+def cmd_phrase(args):
+    """话术 → 命令映射：给新用户「照着说」，也给 Agent 查映射表。
+
+    花钱类意图永远只回显命令，不自动执行（红线）。
+    """
+    from src import phrases as ph
+    if not args.text:
+        print(ph.table_markdown())
+        return
+    hit = ph.match(args.text)
+    if not hit:
+        print(f"没匹配到已知意图。可以看看完整话术表：python main.py phrase")
+        print("或直接问：python main.py capabilities")
+        return
+    print(f"你说的是：「{args.text}」")
+    print(f"→ 意图：{hit['intent']}　渲染：{hit['type'] or '纯文本'}")
+    print(f"→ 命令：{hit['cmd']}")
+    print(f"→ 说明：{hit['note']}")
+    if not ph.runnable(hit["intent"]):
+        print("⛔ 该意图涉及写入/花钱动作，需用户本人明确确认后才执行，这里只回显命令。")
+        return
+    if args.run:
+        print("→ 立即执行：")
+        import subprocess
+        cmd = hit["cmd"].replace("<门店code>", args.store or "1421252")
+        cmd = cmd.replace("<商品>", args.item or "麦旋风").replace("<> x1", " x1")
+        cmd = cmd.replace("<草稿.json>", args.draft or "")
+        subprocess.run(cmd, shell=True)
+
+
 def cmd_init(args):
     """一键生成 config.local.json 模板，并打印领 Token 指引。"""
     from src import config as cfgmod
@@ -378,6 +408,14 @@ def main():
     p = sub.add_parser("init", help="生成 config.local.json 模板 + 领 Token 指引")
     p.add_argument("--force", action="store_true", help="覆盖已存在的配置")
     p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("phrase", help="常用话术 → 命令映射（不传参数则打印话术表）")
+    p.add_argument("text", nargs="?", default="", help="用户说的一句话，如「麦当劳有什么优惠」")
+    p.add_argument("--run", action="store_true", help="只读意图可直接执行；花钱意图一律拒绝")
+    p.add_argument("--store", default="", help="配合 --run 补门店 code")
+    p.add_argument("--item", default="", help="配合 --run 补商品名")
+    p.add_argument("--draft", default="", help="配合 --run 补草稿文件名")
+    p.set_defaults(fn=cmd_phrase)
 
     p = sub.add_parser("doctor", help="首次使用自检（只读，不下单不领券）")
     p.add_argument("--offline", action="store_true", help="跳过 Token 连通性探测（离线可用）")
