@@ -6,6 +6,7 @@
 takeWayCode 只能来自 calculate-price 的 takeWayList。
 """
 import json
+import time
 
 from .normalize import normalize_name
 from . import price_memory
@@ -79,17 +80,21 @@ def _menu_index(client, store_code: str) -> dict[str, dict]:
     return meal_index_from_query_meals(md if isinstance(md, dict) else {})
 
 
-def _coupon_candidates(client, store_code: str) -> list[dict]:
+def _coupon_candidates(client, store_code: str) -> tuple[list[dict], list[str]]:
     """合并卡包券 + 门店可用券，去重。
 
+    返回 (券列表, 警告列表)。某一路查询失败不再静默吞掉，
+    而是记入 warnings 让确认卡标注「结果可能不完整」。
     实测结构：query-my-coupons → data.coupons[]（id/code/title…）。
     """
     coupons: dict[str, dict] = {}
-    for fetch in (lambda: client.my_coupons(),
-                  lambda: client.store_coupons(store_code)):
+    warnings: list[str] = []
+    for label, fetch in (("卡包券", lambda: client.my_coupons()),
+                         ("门店券", lambda: client.store_coupons(store_code))):
         try:
             raw = fetch()
-        except Exception:
+        except Exception as e:
+            warnings.append(f"{label}读取失败: {e}")
             continue
         d = raw.get("data") if isinstance(raw, dict) else raw
         items: list = []
@@ -104,7 +109,7 @@ def _coupon_candidates(client, store_code: str) -> list[dict]:
             cid = str(c.get("id") or c.get("couponId") or "")
             if cid:
                 coupons[cid] = c
-    return list(coupons.values())
+    return list(coupons.values()), warnings
 
 
 def calc_price(client, store_code: str, items: list[dict], coupon: dict | None = None,
@@ -140,17 +145,19 @@ def optimize(client, store_code: str, wanted: list[tuple[str, int]],
 
     items = build_items(client, store_code, wanted)
 
-    # ① 无券基线
+    # ① 无券基线（必要查询：失败/无金额必须报错，绝不产出误导草稿）
     base = calc_price(client, store_code, items)
     best = {"coupon": None, "result": base}
     best_price = _price_of(base)
 
     # ② 线性枚举每张券各算一次（积分券限一张不叠加，无需组合）
-    for c in _coupon_candidates(client, store_code):
+    coupons, warnings = _coupon_candidates(client, store_code)
+    for c in coupons:
         try:
             r = calc_price(client, store_code, items, c)
-        except Exception:
-            continue  # 不适用该单的券直接跳过
+        except Exception as e:
+            warnings.append(f"券 {c.get('id') or c.get('couponId')} 算价失败: {e}")
+            continue
         p = _price_of(r)
         if p < best_price:
             best = {"coupon": c, "result": r}
@@ -159,6 +166,8 @@ def optimize(client, store_code: str, wanted: list[tuple[str, int]],
     take_way = _pick_take_way(best["result"])
     draft = _make_draft(store_code, items, best, take_way, track)
     _attach_product_breakdown(draft, best["result"])
+    if warnings:
+        draft["pricingWarnings"] = warnings
     return draft
 
 
@@ -199,9 +208,10 @@ def _attach_product_breakdown(draft: dict, calc_result: dict):
 
 
 def _price_of(calc_result: dict) -> float:
+    """从算价结果提取可识别金额（分）。找不到有效金额直接抛错，而非返回 inf。"""
     d = calc_result.get("data") if isinstance(calc_result, dict) else calc_result
     if not isinstance(d, dict):
-        return float("inf")
+        raise ValueError("算价结果无 data 字段，无法提取金额")
     for key in ("price", "payPrice", "realTotalAmount"):
         try:
             v = float(d.get(key))
@@ -209,7 +219,7 @@ def _price_of(calc_result: dict) -> float:
                 return v
         except (TypeError, ValueError):
             continue
-    return float("inf")
+    raise ValueError("算价结果缺少可识别的金额字段（price/payPrice/realTotalAmount）")
 
 
 def _pick_take_way(calc_result: dict) -> dict | None:
@@ -235,12 +245,22 @@ def _make_draft(store_code: str, items: list[dict], best: dict,
     orig = d.get("originalPrice")
     discount = d.get("discount")
     coupon = best["coupon"] or {}
+
+    # 硬校验：取餐方式缺失 / 金额缺失 → 直接报错，不产出不可下单或误导的草稿
+    take_way_code = (take_way or {}).get("code") or (take_way or {}).get("takeWayCode") or ""
+    if not take_way_code:
+        raise ValueError("算价结果缺少取餐方式（takeWayList 为空），无法生成可下单草稿")
+    yuan = _fen2yuan(price)
+    if yuan <= 0:
+        raise ValueError("算价结果缺少有效金额，无法生成草稿")
+
     draft = {
         "storeCode": store_code,
         "storeName": d.get("storeName") or store_code,
         "takeWay": "pickup",
-        "takeWayCode": (take_way or {}).get("code") or (take_way or {}).get("takeWayCode") or "",
+        "takeWayCode": take_way_code,
         "takeWayName": (take_way or {}).get("title") or (take_way or {}).get("name") or "",
+        "quotedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         "items": items,
         "coupon": ({
             "couponId": str(coupon.get("id") or coupon.get("couponId") or ""),
@@ -263,3 +283,16 @@ def _make_draft(store_code: str, items: list[dict], best: dict,
 
 def draft_to_json(draft: dict) -> str:
     return json.dumps(draft, ensure_ascii=False, indent=2)
+
+
+def reprice_draft(client, draft: dict) -> dict:
+    """确认前重新算价：按草稿的 store/items 重新最优算价，返回最新 draft。
+
+    下单前把「用户看过的那份草稿」与「此刻重新算出的草稿」比对，
+    价格/券/商品有变化就拒绝并重新展示（见 order_exec.diff_draft）。
+    """
+    wanted = [(it.get("name") or it.get("productCode"), int(it.get("quantity") or 1))
+              for it in (draft.get("items") or [])]
+    if not wanted:
+        raise ValueError("草稿缺少商品清单，无法重新算价")
+    return optimize(client, draft["storeCode"], wanted, track="global")

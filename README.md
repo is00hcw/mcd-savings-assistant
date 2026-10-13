@@ -41,7 +41,8 @@
 | `report` | 省钱账单（细看/存档） | HTML 页面 | `report` |
 | `share` | 省钱战报（对外转发） | 图片 SVG | `share` |
 
-每个命令都支持 `--format inline|json|html|svg`，例如：
+**产出 payload 的命令**支持 `--format inline|json|html|svg`（`patrol` / `best` / `coupons` /
+`report` / `share` / `doctor` / `capabilities` / `render`），例如：
 
 ```bash
 python main.py patrol  --format inline           # 内联卡片（默认，任何宿主可渲染）
@@ -51,7 +52,16 @@ python main.py share   --format svg  --out war.svg
 python main.py render  --payload pay.json --format html   # 渲染层可插拔验证
 ```
 
+过程型命令（`schedule` / `order` / `meals` / `stores` / `warmup` / `raw`）不产 payload，
+输出文本进度或原始 JSON，**没有** `--format` 参数。
+
 设计原则：**图片只用于分享、不用于交互**——确认闸永远是卡片/按钮，绝不靠图片。
+
+> **关于「交互卡片」**：payload 的 `actions[]` 携带 `{id, label, command}` 元数据，
+> 其中 `command` 是给 Agent/宿主执行的指令（含 `--yes` 等凭据，不展示给终端用户）。
+> **普通 Markdown 的 `[确认下单]` 文本本身不可点击**——真正的可点按钮需要宿主
+> （如 WorkBuddy）识别 `actions[]` 后单独接线；纯 CLI 下你看到的是文字，需手动回复
+> 「确认下单」并执行 `order --draft ...` 命令。
 
 ### 消息格式规范（四种场景的样例）
 
@@ -64,16 +74,17 @@ python main.py render  --payload pay.json --format html   # 渲染层可插拔�
 - 44.5元　原价
 - **39.5元**　到手价
 - **5.0元**　省
+- 18:30　报价时间
 
 - 薯条 × 2　¥29（中薯条 · 单价 ¥14.5）
 - 经典麦旋风 × 1　¥15.5（单价 ¥15.5）
 
 [确认下单]　[再想想]
 
-> 到点任务 sch-20261013-121956｜加班餐｜麦当劳深圳金环宇大厦餐厅（堂食）｜券：9.9元中杯冰美式（有效期至 2026-10-18 23:59:59）｜⛔ 这条只是确认消息，我不会自动下单。
+> 到点任务 sch-20261013-121956｜加班餐｜麦当劳深圳金环宇大厦餐厅（堂食）｜券：9.9元中杯冰美式（有效期至 2026-10-18 23:59:59）｜⛔ 这条只是确认消息，我不会自动下单。｜报价 18:30，30 分钟内有效，超时需重新确认
 ```
 
-要素：**到点时间 · 原价/到手价/省 · 逐件商品（数量·小计·官方规格名·单价）· 门店与取餐方式 · 用的哪张券+券到期时间 · 明确的下一步 · 红线声明**。
+要素：**到点时间 · 报价时间 · 原价/到手价/省 · 逐件商品（数量·小计·官方规格名·单价）· 门店与取餐方式 · 用的哪张券+券到期时间 · 报价有效期 · 明确的下一步 · 红线声明**。
 
 **② 降价提醒**（`type=alert`）：
 
@@ -133,8 +144,9 @@ python main.py schedule watch           # 常驻轮询（本地调试用，生�
 | 客户端白名单 | `create-order` 等花钱工具无 `confirm=True` 直接拒绝 |
 | 到点客户端外壳 | `_NoMoneyClient` **默认拒绝**：只放行显白名单的只读方法，调用花钱接口/方法一律 `PermissionError`（连 `auto-bind-coupons` 也不许） |
 | 草稿确认闸 | 到点产出的草稿强制 `confirmedByHuman=false`，无用户确认执行必被拒 |
+| 确认重算价 | 下单前按草稿重新算价并比对，价格/券/商品变了就拒绝；草稿报价超 30 分钟或券已过期也拒绝；`--confirm-text` 必须精确等于「确认下单」 |
 
-也就是说：**即使代码将来出 bug，到点也不可能自己下单。**
+也就是说：**即使代码将来出 bug，到点也不可能自己下单。** 而且下单那一刻若价格/券已变，同样会被拦下要求重新确认。
 
 配合系统定时任务（Windows 任务计划 / cron）：
 
@@ -169,6 +181,7 @@ python main.py schedule watch           # 常驻轮询（本地调试用，生�
 | 「今天吃麦当劳哪个划算 / 最便宜」 | best | `python main.py best --store <门店code> --items "<商品> x1"` | 需确认：可加 `--track top3` 用其购买记录做个性化推荐 |
 | 「确认下单 / 就这个，下吧」 | order | `python main.py order --draft <草稿.json> --yes --confirm-text "确认下单"` | ⚠️ 唯一允许执行花钱动作的入口；草稿必须是刚展示给用户的那份 |
 | 「算了，先别买」 | cancel | （不执行任何命令） | 礼貌收尾，不要再追问要不要下单 |
+| 「取消所有未支付订单」 | cancel_unpaid | `python main.py cancel`（预览）→ `python main.py cancel --yes --confirm-text "确认取消"` | ⚠️ 取消不可逆；先列清单，确认后才逐单取消 |
 | **复盘与分享** | | | |
 | 「我一共省了多少钱」 | report | `python main.py report --period month` | 默认按月，可换 today/week/all |
 | 「发个战报 / 生成战报图」 | share | `python main.py share --draft <草稿.json>` | 图片用于对外转发，配方不含任何凭据 |
@@ -242,6 +255,9 @@ python main.py best --store <code> --items "经典麦旋风 x1" [--track global|
                                              # 带券枚举算最低价，产出 confirm 确认卡（只读）
 python main.py order --draft <draft.json> --yes --confirm-text "确认下单"
                                              # ⚠️ 红线：必须你本人确认后才执行
+python main.py cancel                         # 预览所有「未支付」订单（只读，不取消）
+python main.py cancel --yes --confirm-text "确认取消"
+                                             # ⚠️ 红线：逐单取消未支付订单，须本人确认
 python main.py report --period month          # 省钱账单 → HTML 页面
 python main.py share --draft <draft.json>     # 省钱战报 → 图片 + 好友复现提示词
 python main.py raw --tool query-my-account   # 调试：直接调任意只读工具

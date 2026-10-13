@@ -251,6 +251,7 @@ def test_phrases():
         ("有券吗", "coupons_preview"), ("帮我把券领了", "coupons_claim"),
         ("麦旋风现在多少钱", "best"), ("今天吃麦当劳哪个划算", "best"),
         ("确认下单", "order"), ("算了先别买", "cancel"),
+        ("取消所有未支付订单", "cancel_unpaid"),
         ("我一共省了多少钱", "report"), ("发个战报", "share"),
         ("怎么用你", "doctor"), ("你好，你会干嘛", "capabilities"),
     ]
@@ -261,7 +262,7 @@ def test_phrases():
 
     # 红线：花钱/写入类意图一律不可自动执行
     assert ph.runnable("patrol") and ph.runnable("report")
-    for danger in ("order", "coupons_claim", "address"):
+    for danger in ("order", "coupons_claim", "address", "cancel_unpaid"):
         assert ph.runnable(danger) is False, f"{danger} 不应可自动执行"
 
     # 话术表可渲染，且覆盖 PHRASES 全量条目
@@ -496,6 +497,240 @@ def test_confirm_format_edge():
     assert "[确认下单]" in txt and "[再想想]" in txt
 
 
+def test_confirm_gate_hardening():
+    """确认闸强化：digest 防篡改 + 报价时效 + 券过期 + 精确确认文本 + 重算价 diff。"""
+    from src import order_exec
+    from datetime import datetime, timedelta
+
+    draft = {
+        "storeCode": "1421252", "takeWayCode": "eat-in",
+        "items": [{"productCode": "4810", "quantity": 2}],
+        "coupon": {"couponId": "1", "couponCode": "ABC", "name": "券",
+                   "expireAt": (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")},
+        "price": 25.0, "originalPrice": 30.0,
+        "quotedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    draft["digest"] = order_exec.draft_digest(draft)
+
+    # 内容篡改 → validate 拒绝
+    tampered = dict(draft); tampered["price"] = 1.0
+    ok, reason = order_exec.validate_for_order(tampered)
+    assert not ok and "不一致" in reason
+
+    # 报价过期（TTL）→ 拒绝
+    old = dict(draft)
+    old["quotedAt"] = (datetime.now() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+    ok, reason = order_exec.validate_for_order(old)
+    assert not ok and "过期" in reason
+
+    # 券过期 → 拒绝（深拷贝，避免改到原 draft 的嵌套 coupon）
+    import copy
+    exp = copy.deepcopy(draft)
+    exp["coupon"]["expireAt"] = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    ok, reason = order_exec.validate_for_order(exp)
+    assert not ok and "过期" in reason
+
+    # 正常 → 放行
+    ok, reason = order_exec.validate_for_order(draft)
+    assert ok, reason
+
+    # human_gate：confirmText 非精确 → 拒绝；精确 → 放行
+    assert order_exec.human_gate({"confirmedByHuman": True, "confirmedAt": "x",
+                                  "confirmedText": "随便"}) is False
+    assert order_exec.human_gate({"confirmedByHuman": True, "confirmedAt": "x",
+                                  "confirmedText": "确认下单"}) is True
+
+    # diff_draft：价格 / 券 / 商品变化都能被捕捉
+    new = dict(draft); new["price"] = 28.0
+    assert any("到手价" in c for c in order_exec.diff_draft(draft, new))
+    new2 = dict(draft); new2["coupon"] = {"couponId": "2", "couponCode": "X", "name": "另一张"}
+    assert any("用券" in c for c in order_exec.diff_draft(draft, new2))
+    new3 = dict(draft); new3["items"] = [{"productCode": "999", "quantity": 1}]
+    assert any("商品清单" in c for c in order_exec.diff_draft(draft, new3))
+    assert order_exec.diff_draft(draft, dict(draft)) == []
+
+
+def test_price_failures_raise():
+    """算价失败不再静默：无金额 / 无取餐方式直接报错，券查询失败记 warnings。"""
+    from src import optimize
+    try:
+        optimize._price_of({"data": {"foo": 1}})
+        assert False, "无金额应报错"
+    except ValueError:
+        pass
+    try:
+        optimize._make_draft("S", [], {"coupon": None, "result": {"data": {"price": 100}}},
+                             None, "global")
+        assert False, "缺 takeWayCode 应报错"
+    except ValueError:
+        pass
+    try:
+        optimize._make_draft("S", [], {"coupon": None, "result": {"data": {}}},
+                             {"code": "eat-in", "title": "堂食"}, "global")
+        assert False, "缺金额应报错"
+    except ValueError:
+        pass
+
+    class Bad:
+        def my_coupons(self): raise RuntimeError("boom")
+        def store_coupons(self, s): return {"data": {"coupons": [{"id": "1"}]}}
+    coupons, warnings = optimize._coupon_candidates(Bad(), "S")
+    assert len(coupons) == 1 and any("失败" in w for w in warnings)
+
+
+def test_schedule_concurrency():
+    """定时任务：claim 防并发 + 失败回滚 pending 并抑制重试。"""
+    from src import schedule as sch
+    from src.mcd_client import McdClient
+    from datetime import datetime
+    import tempfile as _tf
+
+    with _tf.TemporaryDirectory() as td:
+        tmp = Path(td)
+        sch.SCHEDULE_FILE = tmp / "schedules.json"
+        sch.OUTBOX_DIR = tmp / "outbox"
+        sch.FIRE_LOCK_FILE = tmp / ".lock"
+
+        # 并发：已 claim(firing) 的任务再次 fire 应 skip
+        s = sch.add(kind="alert", at="09:00", note="测试")
+        sch._mark(s["id"], status="firing")
+        r = sch.fire(sch._NoMoneyClient(McdClient("x")), s)
+        assert r.get("skipped") is True and "firing" in r["reason"]
+
+        # 失败回滚：order 分支算价抛异常 → 回滚 pending + lastError + nextRetryAt
+        s2 = sch.add(kind="order", at="10:00", store="S", items="麦旋风 x1")
+
+        class BoomClient:
+            def meals(self, *a, **kw): raise RuntimeError("simulated fail")
+            def my_coupons(self): raise RuntimeError("simulated fail")
+            def store_coupons(self, s): raise RuntimeError("simulated fail")
+        try:
+            sch.fire(sch._NoMoneyClient(BoomClient()), s2)
+            assert False, "算价失败应上抛"
+        except RuntimeError:
+            pass
+        cur = sch._get(s2["id"])
+        assert cur["status"] == "pending"
+        assert cur.get("lastError") and cur.get("nextRetryAt")
+        # due() 在 nextRetryAt 之前不返回该任务（抑制补触发）
+        assert sch.due(schedules=[cur], now=datetime.now()) == []
+
+
+def test_is_claimable():
+    """券筛选：couponStatus / label 已领取均被排除，正常券可领。"""
+    from src import coupons
+    assert coupons.is_claimable({"couponName": "A", "couponStatus": "HAVING_RECEIVE"}) is False
+    assert coupons.is_claimable({"couponName": "A", "status": "RECEIVED"}) is False
+    assert coupons.is_claimable({"couponName": "A", "couponStatus": "", "label": "已领取"}) is False
+    assert coupons.is_claimable({"couponName": "A", "couponStatus": "", "label": ""}) is True
+    assert coupons.is_claimable({}) is False
+
+
+def test_auto_claim_diff():
+    """领券回执：本次领到 = 领前/领后卡包 id 差集，而非候选列表数量。"""
+    from src import coupons
+
+    class Fake:
+        def __init__(self): self.wallet = ["c1"]
+        def my_coupons(self):
+            return {"data": {"coupons": [{"id": i} for i in self.wallet]}}
+        def available_coupons(self):
+            # 2 张「可领」，但实际只领到 1 张 → 应报 1，而不是按候选数报 2
+            return {"data": [{"couponName": "券A", "couponStatus": "", "label": ""},
+                             {"couponName": "券B", "couponStatus": "", "label": ""}]}
+        def call(self, name, args=None, confirm=False):
+            if name == "auto-bind-coupons":
+                self.wallet = ["c1", "c2"]
+                return {"ok": True}
+            raise AssertionError(name)
+
+    r = coupons.auto_claim(Fake())
+    assert r["claimedCount"] == 1
+    assert r["claimedIds"] == ["c2"]
+    assert r["walletCount"] == 2
+
+
+def test_validate_payload():
+    """payload 契约校验：缺 title / 非法 action / 非法 type 必须拒绝。"""
+    from src import present
+    try:
+        present.validate_payload({"schemaVersion": 1, "type": "alert"})
+        assert False, "缺 title 应拒绝"
+    except ValueError:
+        pass
+    try:
+        present.validate_payload({"schemaVersion": 1, "type": "confirm", "title": "x",
+                                  "actions": [{"id": "confirm"}]})
+        assert False, "action 缺 label 应拒绝"
+    except ValueError:
+        pass
+    ok = present.validate_payload({"schemaVersion": 1, "type": "alert", "title": "x"})
+    assert ok["title"] == "x"
+
+
+def test_cancel():
+    """取消未支付订单：保守识别 + 逐单取消带 confirm=True + 失败留痕。"""
+    from src import cancel
+
+    # ① 状态识别：只命中「未支付」关键词，终态与未知状态一律不判
+    assert cancel.is_unpaid_status("待支付") is True
+    assert cancel.is_unpaid_status("未支付") is True
+    assert cancel.is_unpaid_status("等待付款") is True
+    assert cancel.is_unpaid_status("订单已完成") is False
+    assert cancel.is_unpaid_status("已取消") is False
+    assert cancel.is_unpaid_status("制作中") is False   # 未知状态保守判否
+    assert cancel.is_unpaid_status("") is False
+    assert cancel.is_unpaid_status(None) is False
+
+    # ② 列表筛选
+    class FakeList:
+        def order_list(self):
+            return {"data": {"list": [
+                {"orderId": "o1", "orderStatus": "订单已完成"},
+                {"orderId": "o2", "orderStatus": "待支付"},
+                {"orderId": "o3", "orderStatus": "制作中"},
+                {"orderId": "o4", "orderStatus": "已取消"},
+            ]}}
+    unpaid, all_orders = cancel.list_unpaid_orders(FakeList())
+    assert [o["orderId"] for o in unpaid] == ["o2"]
+    assert len(all_orders) == 4
+
+    # ③ 逐单取消：每单 cancel-order 必须带 confirm=True（红线），失败不中断
+    calls = []
+    class FakeCancel:
+        def call(self, name, args=None, confirm=False):
+            calls.append((name, args, confirm))
+            if name == "cancel-order":
+                if args["orderId"] == "o_fail":
+                    raise RuntimeError("simulated fail")
+                return {"ok": True}
+            raise AssertionError(name)
+    r = cancel.cancel_orders(FakeCancel(), [{"orderId": "o1"}, {"orderId": "o_fail"},
+                                            {"orderId": "o3"}], reason="1")
+    assert all(c[2] is True for c in calls), "cancel-order 必须 confirm=True"
+    assert all(c[1]["cancelReasonCode"] == "1" for c in calls)
+    assert len(r["cancelled"]) == 2 and len(r["failed"]) == 1
+    assert r["failed"][0]["orderId"] == "o_fail"
+
+
+def test_cancel_payload():
+    """取消未支付：预览 confirm 卡（确认动作不给用户看 command）+ 回执 alert。"""
+    from src import payloads, present
+    unpaid = [{"orderId": "o2", "storeName": "测试店", "realTotalAmount": "25.9",
+               "createTime": "2026-10-13 12:00:00", "orderStatus": "待支付"}]
+    p = payloads.cancel_unpaid_preview(unpaid, scanned=10)
+    assert p["type"] == "confirm"
+    assert {a["id"] for a in p["actions"]} == {"cancel_all", "keep"}
+    assert "取消不可逆" in p["meta"]["hint"]
+    txt = present.render_inline(p)
+    assert "待确认取消" in txt and "[确认取消]" in txt
+    assert "python main.py cancel" not in txt  # command 不给终端用户看
+
+    r = payloads.cancel_unpaid_receipt({"cancelled": [{"orderId": "o2"}], "failed": []})
+    assert r["type"] == "alert"
+    assert r["metrics"][0]["value"] == 1
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -515,6 +750,14 @@ def main():
         test_fuzzy_prefers_bought()
         test_message_format()
         test_confirm_format_edge()
+        test_confirm_gate_hardening()
+        test_price_failures_raise()
+        test_schedule_concurrency()
+        test_is_claimable()
+        test_auto_claim_diff()
+        test_validate_payload()
+        test_cancel()
+        test_cancel_payload()
     print("ALL OFFLINE TESTS PASSED ✅")
 
 

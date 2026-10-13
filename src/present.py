@@ -322,6 +322,32 @@ def render_svg(p: dict, width: int = 640) -> str:
 # ---------------------------------------------------------------------------
 # 渲染分发（渲染层可插拔的唯一入口）
 # ---------------------------------------------------------------------------
+def validate_payload(p: dict) -> dict:
+    """校验 payload 结构与必填字段，不合法抛 ValueError。
+
+    外部契约校验：type 合法 + title/schemaVersion 必填 +
+    metrics/items/actions 为 list + 每个 action 含稳定的 id 与 label。
+    （command 是给宿主/Agent 的可执行指令，不作为按钮直接可用。）
+    """
+    if not isinstance(p, dict):
+        raise ValueError("payload 必须是 dict")
+    t = p.get("type")
+    if t not in VALID_TYPES:
+        raise ValueError(f"payload type 非法: {t!r}，应为 {VALID_TYPES} 之一")
+    if not p.get("title"):
+        raise ValueError("payload 缺少必填字段 title")
+    if "schemaVersion" not in p:
+        raise ValueError("payload 缺少必填字段 schemaVersion")
+    for field in ("metrics", "items", "actions"):
+        v = p.get(field)
+        if v is not None and not isinstance(v, list):
+            raise ValueError(f"payload.{field} 必须是 list")
+    for a in (p.get("actions") or []):
+        if not isinstance(a, dict) or not a.get("id") or not a.get("label"):
+            raise ValueError("payload.actions[] 必须含稳定的 id 与 label")
+    return p
+
+
 def render(p: dict, fmt: str = "auto") -> dict:
     """按 fmt 渲染 payload。
 
@@ -329,8 +355,7 @@ def render(p: dict, fmt: str = "auto") -> dict:
     返回 {"format": 实际格式, "content": 内容, "payload": payload}
     auto 在 CLI 下默认降级为 inline（原则③：任何宿主都能渲染）。
     """
-    if p.get("type") not in VALID_TYPES:
-        raise ValueError("payload 缺少合法 type")
+    validate_payload(p)
     if fmt == "auto":
         fmt = p.get("preferredRender") or "inline"
     if fmt in ("inline", "md"):

@@ -58,6 +58,7 @@ python main.py schedule cancel <id>
 | 「X 现在多少钱」「哪个划算」 | `best --store <code> --items "X x1"` | confirm |
 | 「确认下单」「就这个，下吧」 | `order --draft <刚展示的草稿> --yes` | confirm |
 | 「算了，先别买」 | 不执行任何命令 | — |
+| 「取消所有未支付订单」 | `cancel`（预览）→ `cancel --yes --confirm-text "确认取消"` | confirm/alert |
 | 「我一共省了多少钱」 | `report --period month` | report |
 | 「发个战报」 | `share --draft <草稿>` | share |
 | 「怎么用你」「你好」 | `capabilities` / `doctor` | — |
@@ -97,11 +98,12 @@ CLI 的一切输出都是**结构化 payload**，带 `type` 字段：
 | type | 场景 | 首选渲染 | 你该怎么展示给用户 |
 | --- | --- | --- | --- |
 | `alert` | 降价提醒 / 领券回执 / 到点提醒 / 积分临期 | 内联卡片 | 直接把 `inline` 文本作为回复内容，数字要醒目 |
-| `confirm` | 下单确认（确认闸）/ 双轨候选二选一 | 交互卡片 | 把 `inline` 文本 + `actions[].command` 一并呈现，**必须等用户明确确认**才可执行 |
+| `confirm` | 下单确认（确认闸）/ 双轨候选二选一 | 交互卡片 | 把 `inline` 文本呈现给用户（`actions[].command` 仅供你执行，**不要贴给用户**），**必须等用户明确确认**才可执行 |
 | `report` | 省钱账单（细看/存档） | HTML 页面 | 生成 HTML 后用文件卡片呈现，引导"打开细看" |
 | `share` | 省钱战报（对外转发） | 图片 | 生成图片后用图片卡片呈现，并附复现提示词 |
 
-所有命令都支持 `--format`：
+**产出 payload 的命令**（`patrol` / `best` / `coupons` / `report` / `share` / `doctor` /
+`capabilities` / `render`）支持 `--format`：
 
 ```bash
 --format inline   # 内联卡片（Markdown 兜底，任何宿主都能渲染；默认）
@@ -109,6 +111,9 @@ CLI 的一切输出都是**结构化 payload**，带 `type` 字段：
 --format html     # 完整 HTML 页面
 --format svg      # 图片（分享用，不承载交互）
 ```
+
+过程型命令（`schedule` / `order` / `meals` / `stores` / `warmup` / `raw`）不产 payload，
+输出文本进度或原始 JSON，**没有** `--format` 参数。
 
 **你必须自己按 `type` 选渲染方式**，不要把所有输出都当纯文本念给用户：
 
@@ -158,11 +163,15 @@ python main.py raw --tool query-my-account
 # 展示 confirm 卡片后，必须等用户明确确认，才允许执行：
 python main.py order --draft <draft.json> --yes --confirm-text "确认下单"
 # 未带 --yes 或用户未确认时，本命令拒绝执行（exit 4）。
+
+# 取消所有未支付订单（先预览，确认后才逐单取消）
+python main.py cancel                                 # 只读预览：列出所有「未支付」订单
+python main.py cancel --yes --confirm-text "确认取消"  # ⚠️ 逐单取消，须本人确认（exit 4 拦截）
 ```
 
 ## 红线（任何情况下不得违反）
 
-1. `order --draft ... --yes` 仅在**用户在本对话中明确确认该草稿后**才可执行；不得自行揣测确认，不得默认勾选。
+1. `order --draft ... --yes --confirm-text "确认下单"` 仅在**用户在本对话中明确确认该草稿后**才可执行；不得自行揣测确认，不得默认勾选。`--confirm-text` 必须精确等于「确认下单」。下单前程序会**重新算价并与草稿比对**，价格/券/商品变了会拒绝并要求重新展示——不要试图绕过。
 2. 严禁调用 `create-order` / `mall-create-order` / `cancel-order` / `draw-lottery` 而无人类确认；领券（`auto-bind-coupons`）同样需显式 `--claim --yes`。
 3. token 与个人信息只存在于 `config.local.json`，不写入任何对话输出、文档或 git。
 4. 巡检与枚举控频：客户端内置 600 次/分钟限流，不要并发绕过。

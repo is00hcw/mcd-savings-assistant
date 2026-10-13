@@ -62,9 +62,14 @@ PHRASES = [
      "intent": "order", "cmd": 'python main.py order --draft <草稿.json> --yes --confirm-text "确认下单"',
      "type": "confirm", "need_confirm": True, "danger": True,
      "note": "唯一允许执行花钱动作的入口；草稿必须是刚展示给用户的那份"},
-    {"phrase": "算了，先别买", "keys": ["算了", "先别", "不买", "取消"],
+    {"phrase": "算了，先别买", "keys": ["算了", "先别", "不买"],
      "intent": "cancel", "cmd": "（不执行任何命令）", "type": None,
      "note": "礼貌收尾，不要再追问要不要下单"},
+    {"phrase": "取消所有未支付订单", "keys": ["未支付", "待支付", "取消订单", "取消所有", "取消未支付"],
+     "intent": "cancel_unpaid",
+     "cmd": 'python main.py cancel（预览）→ python main.py cancel --yes --confirm-text "确认取消"',
+     "type": "confirm", "need_confirm": True, "danger": True,
+     "note": "取消不可逆；先列清单，确认后才逐单取消"},
 
     # ---------- 复盘 / 分享 ----------
     {"phrase": "我一共省了多少钱", "keys": ["省了多少", "一共省", "省了多少钱"],
@@ -85,7 +90,7 @@ PHRASES = [
 ]
 
 # 绝不自动执行白名单（与 mcd_client.MONEY_WRITE 呼应）
-NEVER_AUTO_RUN = {"order", "coupons_claim", "address"}
+NEVER_AUTO_RUN = {"order", "coupons_claim", "address", "cancel_unpaid"}
 
 
 def match(text: str) -> dict | None:
@@ -115,7 +120,7 @@ def table_markdown() -> str:
         ("打招呼与自检", ["capabilities", "doctor"]),
         ("盯价与选店", ["patrol", "stores", "meals"]),
         ("领券", ["coupons_preview", "coupons_claim"]),
-        ("算价与下单", ["best", "order", "cancel"]),
+        ("算价与下单", ["best", "order", "cancel", "cancel_unpaid"]),
         ("复盘与分享", ["report", "share"]),
         ("配置与地址", ["address"]),
     ]

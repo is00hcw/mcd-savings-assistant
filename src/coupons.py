@@ -2,16 +2,74 @@
 """C · 自动领券（免费写操作，允许自动执行，留回执）"""
 import time
 
+# 已领取状态取值（实测 couponStatus 可能是英文枚举，label 可能含「已领取」）
+_CLAIMED_STATUSES = ("HAVING_RECEIVE", "RECEIVED", "ALREADY_RECEIVE", "已领取")
+
+
+def is_claimable(coupon: dict) -> bool:
+    """判断一张券是否仍可领取（未领取）。
+
+    双保险：couponStatus 字段 + label 文本。不再只靠 label 里的「已领取」
+    字符串——接口若改用状态字段表示已领取，也能正确排除。
+    """
+    if not isinstance(coupon, dict):
+        return False
+    # 没有任何券标识 → 不是有效券，不算「可领」
+    ident = (coupon.get("couponName") or coupon.get("name") or coupon.get("title")
+             or coupon.get("id") or coupon.get("couponId")
+             or coupon.get("couponCode") or coupon.get("code"))
+    if not ident:
+        return False
+    status = str(coupon.get("couponStatus") or coupon.get("status") or "").strip()
+    if status.upper() in _CLAIMED_STATUSES or status == "已领取":
+        return False
+    label = str(coupon.get("label") or "")
+    if "已领取" in label:
+        return False
+    return True
+
+
+def _wallet_ids(client, errors: list) -> set[str]:
+    """query-my-coupons 的券 id 集合（用于领前/领后差异核验）。"""
+    try:
+        mine = client.my_coupons()
+    except Exception as e:
+        errors.append(f"query-my-coupons: {e}")
+        return set()
+    d = mine.get("data") if isinstance(mine, dict) else mine
+    items: list = []
+    if isinstance(d, list):
+        items = d
+    elif isinstance(d, dict):
+        for k in ("coupons", "list", "couponList"):
+            if isinstance(d.get(k), list):
+                items = d[k]
+                break
+    ids: set[str] = set()
+    for c in items:
+        cid = str(c.get("id") or c.get("couponId") or c.get("code")
+                  or c.get("couponCode") or "")
+        if cid:
+            ids.add(cid)
+    return ids
+
 
 def auto_claim(client) -> dict:
-    """available-coupons → auto-bind-coupons → query-my-coupons 校验入库。
+    """available-coupons → auto-bind-coupons → query-my-coupons 前后差异核验。
 
-    返回回执 {claimed, walletCount, ts}。失败不无限重试。
+    返回回执 {available, bindResult, walletCount, claimedCount, claimedIds, errors}。
+    「本次领到」不再按候选列表数量推算，而是领前/领后卡包券 id 集合的差集，
+    避免把「本来就已领的券」误算成本次领到。失败不无限重试。
     """
     receipt = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-               "available": [], "bindResult": None, "walletCount": None,
+               "available": [], "bindResult": None,
+               "walletCount": None, "claimedCount": 0, "claimedIds": [],
                "errors": []}
 
+    # ① 领前卡包快照（差异核验基线）
+    before = _wallet_ids(client, receipt["errors"])
+
+    # ② 可领券清单
     try:
         avail = client.available_coupons()
         d = avail.get("data") if isinstance(avail, dict) else avail
@@ -25,26 +83,17 @@ def auto_claim(client) -> dict:
     except Exception as e:
         receipt["errors"].append(f"available-coupons: {e}")
 
+    # ③ 一键领取
     try:
         bind = client.call("auto-bind-coupons")
         receipt["bindResult"] = bind
     except Exception as e:
         receipt["errors"].append(f"auto-bind-coupons: {e}")
 
-    # 校验入库（实测：query-my-coupons → data.coupons[]）
-    try:
-        mine = client.my_coupons()
-        d = mine.get("data") if isinstance(mine, dict) else mine
-        items: list = []
-        if isinstance(d, list):
-            items = d
-        elif isinstance(d, dict):
-            for k in ("coupons", "list", "couponList"):
-                if isinstance(d.get(k), list):
-                    items = d[k]
-                    break
-        receipt["walletCount"] = len(items)
-    except Exception as e:
-        receipt["errors"].append(f"query-my-coupons: {e}")
+    # ④ 领后卡包快照 → 差集 = 本次真正领到
+    after = _wallet_ids(client, receipt["errors"])
+    receipt["claimedIds"] = sorted(after - before)
+    receipt["claimedCount"] = len(receipt["claimedIds"])
+    receipt["walletCount"] = len(after)
 
     return receipt

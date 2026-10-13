@@ -14,8 +14,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -24,6 +26,9 @@ from . import payloads, present
 
 SCHEDULE_FILE = CACHE_DIR / "schedules.json"
 OUTBOX_DIR = CACHE_DIR / "outbox"
+FIRE_LOCK_FILE = CACHE_DIR / ".schedule-fire.lock"
+
+RETRY_AFTER_SECONDS = 5 * 60   # 触发失败后的重试抑制窗口（避免同分钟反复补触发）
 
 KIND_ORDER = "order"   # 到点重算价 → 推送确认卡（不自动下单）
 KIND_ALERT = "alert"   # 到点发一条提醒（纯文本/卡片，无副作用）
@@ -47,6 +52,60 @@ def _save(items: list[dict]):
         json.dump(items, f, ensure_ascii=False, indent=2)
 
 
+@contextmanager
+def _exclusive_lock(lock_path: Path):
+    """跨进程互斥锁（Windows msvcrt / Unix flock）。
+
+    保护「到点判断 → claim → 触发」的状态流转：两个同时运行的定时任务
+    进程不会对同一条任务各生成一份确认草稿。拿不到锁抛 OSError（调用方跳过）。
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, 0)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)   # 非阻塞：拿不到抛 OSError
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                os.lseek(fd, 0, 0)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _get(sid: str) -> dict | None:
+    for s in _load():
+        if s.get("id") == sid:
+            return s
+    return None
+
+
+def _mark(sid: str, **fields) -> dict | None:
+    """更新单条任务的部分字段并保存，返回更新后的任务。"""
+    items = _load()
+    hit = None
+    for s in items:
+        if s.get("id") == sid:
+            s.update(fields)
+            hit = s
+    _save(items)
+    return hit
+
+
+def _after_seconds(seconds: int) -> str:
+    return (datetime.now() + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 # ---------------------------------------------------------------------------
 # 增删查
 # ---------------------------------------------------------------------------
@@ -60,7 +119,7 @@ def add(kind: str = KIND_ORDER, at: str = "", store: str = "", items: str = "",
     """
     spec = parse_at(at)
     sch = {
-        "id": "sch-" + datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "id": "sch-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"),
         "kind": kind, "at": spec["raw"], "time": spec["time"], "date": spec["date"],
         "store": store, "items": items, "track": track, "coupon": coupon,
         "note": note, "repeatDays": days,
@@ -148,6 +207,14 @@ def due(schedules: list[dict] | None = None, now: datetime | None = None) -> lis
     for s in (schedules if schedules is not None else list_all()):
         if s.get("status") != "pending":
             continue
+        # 失败重试抑制：上次触发失败后，nextRetryAt 之前不再补触发
+        nra = s.get("nextRetryAt")
+        if nra:
+            try:
+                if datetime.strptime(str(nra)[:19], "%Y-%m-%d %H:%M:%S") > now:
+                    continue
+            except ValueError:
+                pass
         t = s.get("time") or "00:00:00"
         hh, mm = int(t[0:2]), int(t[3:5])
         ss = int(t[6:8] or 0)
@@ -256,29 +323,69 @@ def fire(client, sch: dict) -> dict:
 
     ⚠️ 绝不调用 create-order。执行仍需用户对 outbox 草稿回复确认后，
     走 `order --draft ... --yes --confirm-text "确认下单"`。
+
+    并发安全：持文件锁 + 锁内 claim（pending→firing），两个同时运行的
+    定时任务进程不会对同一条任务各生成一份确认草稿。
     """
+    try:
+        with _exclusive_lock(FIRE_LOCK_FILE):
+            return _fire_locked(client, sch)
+    except OSError:
+        return {"skipped": True, "id": sch.get("id"),
+                "reason": "另一进程正在触发定时任务，本次跳过"}
+
+
+def _fire_locked(client, sch: dict) -> dict:
+    """持锁下的触发：先 claim 防并发，失败回滚 pending 并抑制重试。"""
+    # 锁内重读最新状态：并发下另一个进程可能已触发/已 claim
+    current = _get(sch["id"])
+    if current is None:
+        return {"skipped": True, "id": sch["id"], "reason": "任务不存在"}
+    if current.get("status") != "pending":
+        return {"skipped": True, "id": sch["id"],
+                "reason": f"任务已处于 {current.get('status')} 状态，跳过"}
+    nra = current.get("nextRetryAt")
+    if nra:
+        try:
+            if datetime.strptime(str(nra)[:19], "%Y-%m-%d %H:%M:%S") > datetime.now():
+                return {"skipped": True, "id": sch["id"], "reason": "上次失败，等待重试窗口"}
+        except ValueError:
+            pass
+    # claim：pending → firing（占位，防并发重复触发）
+    _mark(sch["id"], status="firing", claimedAt=_now())
+    sch = _get(sch["id"]) or current
+
     client = _NoMoneyClient(client)          # ← 硬隔离：到点阶段无写权限
-    if sch.get("kind") == KIND_ALERT:
-        items = [{"name": n, "quantity": q, "note": f"待下单，需你确认"}
-                 for n, q in _parse_items(sch.get("items") or "")]
-        p = payloads.alert_meal_time(items=items, sch=sch)
-        r = _emit(sch, p, None)
+    try:
+        if sch.get("kind") == KIND_ALERT:
+            items = [{"name": n, "quantity": q, "note": f"待下单，需你确认"}
+                     for n, q in _parse_items(sch.get("items") or "")]
+            p = payloads.alert_meal_time(items=items, sch=sch)
+            r = _emit(sch, p, None)
+            r["readOnlyCalls"] = client.calls
+            return r
+
+        from . import optimize, order_exec
+        wanted = _parse_items(sch.get("items") or "")
+        draft = optimize.optimize(client, sch["store"], wanted,
+                                  track=sch.get("track") or "global")
+        draft["scheduledFrom"] = {"id": sch["id"], "at": sch.get("at"),
+                                  "note": sch.get("note")}
+        draft["confirmedByHuman"] = False         # 显式标记：尚未获用户确认
+        draft_path = order_exec.save_draft(draft)
+
+        # 标题 / 话术 / 红线声明统一由 confirm_from_draft 依据 scheduledFrom 生成，
+        # 这里不再手工拼 summary/hint（避免两处文案漂移）。
+        p = payloads.confirm_from_draft(draft, str(draft_path))
+        r = _emit(sch, p, draft_path)
         r["readOnlyCalls"] = client.calls
         return r
-
-    from . import optimize, order_exec
-    wanted = _parse_items(sch.get("items") or "")
-    draft = optimize.optimize(client, sch["store"], wanted, track=sch.get("track") or "global")
-    draft["scheduledFrom"] = {"id": sch["id"], "at": sch.get("at"), "note": sch.get("note")}
-    draft["confirmedByHuman"] = False         # 显式标记：尚未获用户确认
-    draft_path = order_exec.save_draft(draft)
-
-    # 标题 / 话术 / 红线声明统一由 confirm_from_draft 依据 scheduledFrom 生成，
-    # 这里不再手工拼 summary/hint（避免两处文案漂移）。
-    p = payloads.confirm_from_draft(draft, str(draft_path))
-    r = _emit(sch, p, draft_path)
-    r["readOnlyCalls"] = client.calls
-    return r
+    except Exception as e:
+        # 失败回滚：保持 pending + 记录错误 + nextRetryAt 抑制重试
+        # （避免「算价失败→仍 pending→下一轮立即补触发」造成重复提醒）
+        _mark(sch["id"], status="pending", lastError=str(e),
+              lastErrorAt=_now(), nextRetryAt=_after_seconds(RETRY_AFTER_SECONDS))
+        raise
 
 
 def _parse_items(s: str) -> list[tuple[str, int]]:
@@ -313,6 +420,11 @@ def _emit(sch: dict, payload: dict, draft_path) -> dict:
             s["firedAt"] = _now()
             s["outbox"] = {"json": str(json_path), "html": str(html_path),
                            "draft": str(draft_path) if draft_path else None}
+            # 成功触发：清掉 claim 占位与上次失败的痕迹
+            s["claimedAt"] = None
+            s["lastError"] = None
+            s["lastErrorAt"] = None
+            s["nextRetryAt"] = None
             rd = int(s.get("repeatDays") or 0)
             # 还有剩余天数 → 保持 pending 等下一次；否则置 fired 收尾
             s["status"] = "pending" if (rd > 0 and s["fireCount"] < rd) else "fired"

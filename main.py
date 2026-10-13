@@ -263,7 +263,7 @@ def cmd_patrol(args):
     if ep:
         payloads_out.append(ep)
     avail = [c for c in (report.get("newCouponsAvailable") or [])
-             if "已领取" not in str(c.get("label") or "")]
+             if coupons_mod.is_claimable(c)]
     if avail and not getattr(args, "no_coupon_hint", False):
         payloads_out.append(present.make_payload(
             "alert", "有券可领",
@@ -341,7 +341,7 @@ def cmd_coupons(args):
         except Exception as e:
             print(f"[领券预览] 失败: {e}")
             sys.exit(1)
-        claimable = [c for c in items if "已领取" not in str(c.get("label") or "")]
+        claimable = [c for c in items if coupons_mod.is_claimable(c)]
         p = present.make_payload(
             "alert", "可领券预览（未领取）",
             f'{get_config().nickname}，这些券现在能领，我没动你的账户。',
@@ -398,7 +398,7 @@ def cmd_best(args):
 
 
 def cmd_order(args):
-    """下单（红线闸）：无 --yes 一律拒绝。"""
+    """下单（红线闸）：无 --yes 一律拒绝；确认必须绑定「刚展示的那份草稿」。"""
     draft_path = Path(order_exec.DRAFT_DIR) / args.draft
     if not draft_path.exists():
         draft_path = Path(args.draft)
@@ -407,18 +407,60 @@ def cmd_order(args):
         print(persona.blocked_by_gate())
         print(optimize.draft_to_json(draft))
         sys.exit(4)
-    if not args.confirm_text:
-        print('需要 --confirm-text "确认下单" 作为显式确认凭据。')
+    # ① 确认凭据必须精确匹配（一次性确认凭证，非任意非空字符串）
+    if str(args.confirm_text or "").strip() != order_exec.CONFIRM_TEXT:
+        print(f'需要精确回复「{order_exec.CONFIRM_TEXT}」作为确认凭据：'
+              f'--confirm-text "{order_exec.CONFIRM_TEXT}"')
         sys.exit(4)
+    # ② 内容摘要 + 报价时效 + 券未过期
+    ok, reason = order_exec.validate_for_order(draft)
+    if not ok:
+        print(f"[下单被拦截] {reason}")
+        print("请重新执行：python main.py best --store <门店code> --items \"<商品> x1\"")
+        sys.exit(4)
+    # ③ 重新算价并比对：价格/券/商品有变化即拒绝（绑定「刚展示的那份草稿」）
+    client = _client()
+    try:
+        fresh = optimize.reprice_draft(client, draft)
+    except (ValueError, McpError) as e:
+        print(f"[下单被拦截] 重新算价失败，拒绝下单：{e}")
+        sys.exit(4)
+    changes = order_exec.diff_draft(draft, fresh)
+    if changes:
+        print("⚠️ 草稿报价已过期，以下内容已变化，请重新生成草稿并确认：")
+        for c in changes:
+            print(f"  - {c}")
+        print("重新算价：python main.py best --store <门店code> --items \"<商品> x1\"")
+        sys.exit(4)
+    # ④ 写入确认标记并执行
     draft["confirmedByHuman"] = True
     draft["confirmedAt"] = sys_date()
     draft["confirmedText"] = args.confirm_text
     if not order_exec.human_gate(draft):
         print(persona.blocked_by_gate())
         sys.exit(4)
-    receipt = order_exec.execute_draft(_client(), draft)
+    receipt = order_exec.execute_draft(client, draft)
     print("下单结果（真实优惠已入账本）:")
     _print(receipt)
+
+
+def cmd_cancel(args):
+    """取消所有未支付订单（MONEY_WRITE，需 --yes --confirm-text 确认）。"""
+    from src import cancel as cancel_mod
+    client = _client()
+    unpaid, all_orders = cancel_mod.list_unpaid_orders(client)
+    if not unpaid:
+        print(f"没有发现未支付订单（共 {len(all_orders)} 笔历史订单，均为已完结状态）。")
+        return
+    if not args.yes:
+        _show(payloads.cancel_unpaid_preview(unpaid, get_config().nickname, len(all_orders)), args)
+        return
+    if str(args.confirm_text or "").strip() != cancel_mod.CONFIRM_TEXT:
+        print(f'需要精确回复「{cancel_mod.CONFIRM_TEXT}」作为确认凭据：'
+              f'--confirm-text "{cancel_mod.CONFIRM_TEXT}"')
+        sys.exit(4)
+    receipt = cancel_mod.cancel_orders(client, unpaid, args.reason)
+    _show(payloads.cancel_unpaid_receipt(receipt, get_config().nickname), args)
 
 
 def cmd_report(args):
@@ -576,6 +618,15 @@ def main():
     p.add_argument("--yes", action="store_true")
     p.add_argument("--confirm-text", dest="confirm_text", default="")
     p.set_defaults(fn=cmd_order)
+
+    p = sub.add_parser("cancel", help="取消所有未支付订单（红线：需 --yes --confirm-text）")
+    p.add_argument("--yes", action="store_true", help="确认执行批量取消")
+    p.add_argument("--confirm-text", dest="confirm_text", default="",
+                   help="确认凭据，须精确等于「确认取消」")
+    p.add_argument("--reason", default="-1",
+                   help="取消原因 code：1=改主意 2=重复下单 3=点错 4=地址/电话错 5=送达时间错 -1=其它")
+    add_fmt(p)
+    p.set_defaults(fn=cmd_cancel)
 
     p = sub.add_parser("report", help="省钱账单 → report HTML 页面")
     p.add_argument("--period", choices=["today", "week", "month", "all"], default="month")

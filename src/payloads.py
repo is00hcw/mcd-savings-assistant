@@ -3,7 +3,7 @@
 
 渲染层（内联卡片 / HTML / 图片）一律不写在这里，由 present.render 分发。
 """
-from . import present, persona
+from . import present, persona, order_exec, coupons
 
 
 # ---------------------------------------------------------------------------
@@ -62,11 +62,14 @@ def alert_expiring_points(ep: dict, nick: str = "老大") -> dict | None:
 
 
 def alert_coupon_receipt(receipt: dict, nick: str = "老大") -> dict:
-    """领券回执 → alert payload（券是免费动作，回执透明化）。"""
+    """领券回执 → alert payload（券是免费动作，回执透明化）。
+
+    「本次领到」用领前/领后卡包券 id 差集（claimedCount），
+    而非按候选列表数量推算，避免把「本就已领的券」误算成本次领到。
+    """
     avail = receipt.get("available") or []
-    # 只统计真·可领取（排除 HAVING_RECEIVE 已领取）
-    claimable = [c for c in avail if "已领取" not in str(c.get("label") or "")]
-    n = len(claimable)
+    claimable = [c for c in avail if coupons.is_claimable(c)]
+    n = int(receipt.get("claimedCount") or 0)
     wallet = receipt.get("walletCount")
     summary = (persona.on_coupons_claimed(n) if not receipt.get("errors")
                else f"{nick}，领券过程有报错，详见明细。")
@@ -141,6 +144,9 @@ def confirm_from_draft(draft: dict, draft_path: str = "") -> dict:
     if sched:
         metrics.insert(0, {"label": "到点时间", "value": sched.get("at") or "到点即取",
                            "unit": "", "emphasis": True})
+    if draft.get("quotedAt"):
+        metrics.append({"label": "报价时间", "value": str(draft["quotedAt"])[11:16],
+                        "unit": ""})
 
     # 到点场景与普通算价场景共用本函数：标题 / 话术 / 红线声明在此统一生成，
     # 避免 schedule.fire 再手工拼一份（文案漂移风险）。
@@ -158,6 +164,13 @@ def confirm_from_draft(draft: dict, draft_path: str = "") -> dict:
         summary = persona.confirm_gate(draft)
         hint_parts = [store_line, f'券：{coupon_txt}',
                       "未收到你的明确确认前，我不会调用 create-order。"]
+
+    # 报价时效 + 结果完整性提示（统一追加，所有确认卡生效）
+    if draft.get("quotedAt"):
+        hint_parts.append(f'报价 {str(draft["quotedAt"])[11:16]}，'
+                          f'{order_exec.QUOTE_TTL_SECONDS // 60} 分钟内有效，超时需重新确认')
+    if draft.get("pricingWarnings"):
+        hint_parts.append("⚠️ 结果可能不完整：" + "；".join(draft["pricingWarnings"]))
 
     return present.make_payload(
         "confirm", title, summary,
@@ -260,4 +273,60 @@ def share_from_draft(draft: dict, drops: int = 0, saved_total: float | None = No
         recipe=build_recipe(draft),
         draft=draft,
         meta={"hint": "配方不含任何凭据；好友复现下单时同样需要他本人确认。"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# cancel：取消未支付订单（MONEY_WRITE，需人类确认闸）
+# ---------------------------------------------------------------------------
+def cancel_unpaid_preview(unpaid: list[dict], nick: str = "老大", scanned: int = 0) -> dict:
+    """未支付订单预览 → confirm payload（确认后才会逐单取消）。"""
+    items = []
+    total = 0.0
+    for o in unpaid:
+        try:
+            amt = float(o.get("realTotalAmount") or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        total += amt
+        items.append({
+            "name": o.get("storeName") or "未知门店",
+            "price": amt,
+            "note": f'订单 {o.get("orderId")} · {o.get("createTime") or ""} · {o.get("orderStatus") or ""}',
+        })
+    return present.make_payload(
+        "confirm", "未支付订单 · 待确认取消",
+        f'{nick}，扫到 {len(unpaid)} 单未支付订单（共 {scanned} 笔历史单），'
+        f'合计 ¥{total:g}。取消后不可恢复，你确认我就逐单取消。',
+        metrics=[
+            {"label": "未支付订单", "value": len(unpaid), "unit": "单", "emphasis": True},
+            {"label": "合计金额", "value": round(total, 2), "unit": "元"},
+        ],
+        items=items,
+        actions=[
+            {"id": "cancel_all", "label": "确认取消", "style": "primary",
+             "command": 'python main.py cancel --yes --confirm-text "确认取消"'},
+            {"id": "keep", "label": "先不动", "style": "ghost"},
+        ],
+        meta={"hint": "⛔ 取消不可逆。以上订单状态为「未支付」；若其中还有你要的单，先别确认。"},
+    )
+
+
+def cancel_unpaid_receipt(receipt: dict, nick: str = "老大") -> dict:
+    """批量取消结果 → alert payload（逐单回执）。"""
+    n_ok = len(receipt.get("cancelled") or [])
+    n_fail = len(receipt.get("failed") or [])
+    items = [{"name": f'订单 {c.get("orderId")}', "note": "已取消"}
+             for c in (receipt.get("cancelled") or [])]
+    items += [{"name": f'订单 {f.get("orderId")}', "note": f'取消失败：{f.get("error")}'}
+              for f in (receipt.get("failed") or [])]
+    summary = f'{nick}，已取消 {n_ok} 单' + (f'，{n_fail} 单失败' if n_fail else '。')
+    return present.make_payload(
+        "alert", "取消未支付订单 · 结果", summary,
+        metrics=[
+            {"label": "已取消", "value": n_ok, "unit": "单", "emphasis": True},
+            {"label": "失败", "value": n_fail, "unit": "单"},
+        ],
+        items=items,
+        meta={"hint": "取消结果已逐单列出；失败的单可稍后重试。"},
     )
