@@ -383,6 +383,56 @@ def test_fuzzy_prefers_bought():
     assert k3 == "" and c3 == []
 
 
+def test_message_format():
+    """消息格式规范：确认卡必须含商品明细/单价/门店/取餐方式/券，红线声明不被覆盖。"""
+    from src import payloads, present, price_memory
+
+    draft = {
+        "storeCode": "1421252", "storeName": "麦当劳深圳金环宇大厦餐厅",
+        "takeWayCode": "eat-in", "takeWayName": "堂食",
+        "items": [{"productCode": "4810", "name": "薯条", "officialName": "中薯条",
+                   "quantity": 2, "unitPrice": 14.5, "subtotal": 29.0}],
+        "coupon": {"couponId": "1", "couponCode": "ABC", "name": "9.9元中杯冰美式",
+                   "expireAt": "2026-10-18 23:59:59"},
+        "price": 39.5, "originalPrice": 44.5, "discount": 5.0,
+        "scheduledFrom": {"id": "sch-x", "at": "18:30", "note": "加班餐"},
+    }
+    p = payloads.confirm_from_draft(draft, "d.json")
+    text = present.render_inline(p)
+
+    # 商品明细：数量 + 小计 + 官方规格名 + 单价
+    assert "薯条 × 2" in text and "¥29" in text and "中薯条" in text and "单价 ¥14.5" in text
+    # 金额三件套 + 到点时间
+    for kw in ("到点时间", "原价", "到手价", "省"):
+        assert kw in text, f"缺少 {kw}"
+    # 门店 + 取餐方式 + 券与到期时间
+    assert "麦当劳深圳金环宇大厦餐厅" in text and "堂食" in text
+    assert "9.9元中杯冰美式" in text and "2026-10-18" in text
+    # 红线与两个动作
+    assert "不会自动下单" in p["meta"]["hint"] or "不会" in p["meta"]["hint"]
+    assert {a["id"] for a in p["actions"]} == {"confirm", "cancel"}
+
+    # 到点消息：追加门店信息而不是覆盖掉红线声明
+    from src import schedule as sch_mod
+    sch_mod.SCHEDULE_FILE = Path(tempfile.gettempdir()) / "_mcd_sched_test.json"
+    try:
+        fake_sch = {"id": "sch-x", "at": "18:30", "note": "加班餐", "kind": "order"}
+        p2 = payloads.confirm_from_draft(draft, "d.json")
+        p2["meta"]["hint"] = (f'到点任务 {fake_sch["id"]}｜{fake_sch["note"]}｜'
+                              f'{draft["storeName"]}（{draft["takeWayName"]}）｜'
+                              f'券：{draft["coupon"]["name"]}｜'
+                              f'⛔ 这条只是确认消息，我不会自动下单。')
+        assert "金环宇大厦" in p2["meta"]["hint"] and "我不会自动下单" in p2["meta"]["hint"]
+    finally:
+        sch_mod.SCHEDULE_FILE = Path(tempfile.gettempdir()) / "_mcd_sched_test.json"
+
+    # 到点提醒：有登记商品时列出商品并注明需确认
+    a = payloads.alert_meal_time(items=[{"name": "薯条", "quantity": 2, "note": "待下单，需你确认"}],
+                                 sch={"at": "11:30", "note": "午饭"})
+    at = present.render_inline(a)
+    assert "薯条 × 2" in at and "需你确认" in at and "11:30" in at
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -399,6 +449,7 @@ def main():
         test_phrases()
         test_schedule()
         test_fuzzy_prefers_bought()
+        test_message_format()
     print("ALL OFFLINE TESTS PASSED ✅")
 
 

@@ -102,16 +102,16 @@ def render_inline(p: dict) -> str:
         out.append("")
         for it in p["items"]:
             name = it.get("name") or it.get("label") or ""
-            extra = it.get("note") or it.get("detail") or ""
-            price = it.get("price")
             qty = it.get("quantity")
+            price = it.get("price")
+            note = it.get("note") or it.get("detail") or ""
             line = f"- {name}"
             if qty:
                 line += f" × {qty}"
             if price not in (None, ""):
-                line += f"　¥{price}"
-            if extra:
-                line += f"　`{extra}`"
+                line += f"　¥{price:g}" if isinstance(price, (int, float)) else f"　¥{price}"
+            if note:
+                line += f"（{note}）"
             out.append(line)
 
     if p["actions"]:

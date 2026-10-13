@@ -15,8 +15,33 @@ from .normalize import normalize_name
 
 BASELINE_FILE = CACHE_DIR / "price_baseline.json"
 PROFILE_FILE = CACHE_DIR / "product_profile.json"
+STORE_NAMES_FILE = CACHE_DIR / "store_names.json"
 SNAPSHOT_DIR = CACHE_DIR / "meals_snapshot"
 SNAPSHOT_TTL = 6 * 3600  # 菜单快照 6 小时
+
+
+# ---------------------------------------------------------------------------
+# 门店名缓存（query-meals / calculate-price 都不返回门店名，
+# 只能从 order-list / query-nearby-stores 顺手记住）
+# ---------------------------------------------------------------------------
+def remember_store_names(pairs: dict) -> int:
+    """记住 storeCode → storeName。pairs: {storeCode: storeName}"""
+    pairs = {str(k): v for k, v in (pairs or {}).items() if k and v}
+    if not pairs:
+        return 0
+    cache = _load(STORE_NAMES_FILE, {})
+    n = 0
+    for code, name in pairs.items():
+        if cache.get(code) != name:
+            cache[code] = name
+            n += 1
+    if n:
+        _save(STORE_NAMES_FILE, cache)
+    return n
+
+
+def get_store_name(store_code: str) -> str:
+    return (_load(STORE_NAMES_FILE, {}) or {}).get(str(store_code), "")
 
 
 def _load(path: Path, default):
@@ -103,6 +128,8 @@ def cold_start_from_orders(client) -> dict:
         sc = od.get("storeCode")
         if sc and sc not in order_stores:
             order_stores.append(str(sc))
+        if sc and od.get("storeName"):
+            remember_store_names({sc: od["storeName"]})
         oid = od.get("orderId") or od.get("orderNo") or od.get("id")
         if not oid:
             continue

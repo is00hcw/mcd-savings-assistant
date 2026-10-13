@@ -212,7 +212,9 @@ def fire(client, sch: dict) -> dict:
     """
     client = _NoMoneyClient(client)          # ← 硬隔离：到点阶段无写权限
     if sch.get("kind") == KIND_ALERT:
-        p = payloads.alert_meal_time()
+        items = [{"name": n, "quantity": q, "note": f"待下单，需你确认"}
+                 for n, q in _parse_items(sch.get("items") or "")]
+        p = payloads.alert_meal_time(items=items, sch=sch)
         r = _emit(sch, p, None)
         r["readOnlyCalls"] = client.calls
         return r
@@ -226,13 +228,25 @@ def fire(client, sch: dict) -> dict:
 
     p = payloads.confirm_from_draft(draft, str(draft_path))
     p["title"] = f'到点了：{sch.get("note") or "该下单了"}'
+    coupon = draft.get("coupon") or {}
+    coupon_txt = ""
+    if coupon:
+        exp = coupon.get("expireAt") or ""
+        coupon_txt = f'用券「{coupon.get("name") or coupon.get("couponCode")}」' \
+                     + (f'（有效期至 {exp}）' if exp else '')
     p["summary"] = (
-        f'{persona.nick()}，{sch.get("at")} 的单我算好了：原价 {draft.get("originalPrice")}，'
-        f'到手 {draft.get("price")}，省 {draft.get("discount")}。'
-        f'（价格与券已按此刻重新计算）你确认我就下，不确认我不动。')
+        f'{persona.nick()}，{sch.get("at")} 的单我按此刻的价格重新算好了：'
+        f'原价 {draft.get("originalPrice")}，到手 {draft.get("price")}'
+        + (f'，省 {draft.get("discount")}' if float(draft.get("discount") or 0) > 0 else "")
+        + (f'，{coupon_txt}' if coupon_txt else "，这单没券可用")
+        + '。你确认我就下，不确认我不动。')
+    # 追加（不覆盖）确认卡里已有的门店/券/取餐信息
+    store_line = (draft.get("storeName") or draft.get("storeCode") or "")
+    if draft.get("takeWayName"):
+        store_line += f'（{draft["takeWayName"]}）'
     p["meta"]["hint"] = (
-        f'到点任务 {sch["id"]}｜{sch.get("note") or "无备注"}｜'
-        f'券：{(draft.get("coupon") or {}).get("name") or "无可用券"}｜'
+        f'到点任务 {sch["id"]}｜{sch.get("note") or "无备注"}｜{store_line}｜'
+        f'券：{coupon_txt or "无可用券"}｜'
         f'⛔ 这条只是确认消息，我不会自动下单。')
     r = _emit(sch, p, draft_path)
     r["readOnlyCalls"] = client.calls

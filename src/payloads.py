@@ -81,13 +81,25 @@ def alert_coupon_receipt(receipt: dict, nick: str = "老大") -> dict:
     )
 
 
-def alert_meal_time(nearby: list[dict] | None = None, nick: str = "老大") -> dict:
-    items = [{"name": s.get("storeName"), "note": s.get("address", "")}
-             for s in (nearby or [])[:5]]
+def alert_meal_time(nearby: list[dict] | None = None, nick: str = "老大",
+                    items: list[dict] | None = None, sch: dict | None = None) -> dict:
+    """到点提醒。若登记了商品/备注，则直接列出用户说好的那一单。"""
+    items = list(items or [])
+    if not items:
+        # 没登记商品时退化为「附近可点的门店」清单
+        items = [{"name": s.get("storeName"), "note": s.get("address", "")}
+                 for s in (nearby or [])[:5]]
+    metrics = [{"label": "到点", "value": (sch or {}).get("at") or "现在", "unit": "",
+                "emphasis": True}]
+    if sch and sch.get("store"):
+        metrics.append({"label": "门店", "value": sch["store"], "unit": ""})
+    title = "到点提醒" + (f'：{sch["note"]}' if sch and sch.get("note") else "")
     return present.make_payload(
-        "alert", "到饭点了", persona.on_meal_time(),
-        metrics=[{"label": "附近门店", "value": len(items), "unit": "家"}],
-        items=items,
+        "alert", title,
+        persona.on_meal_time() if not sch else
+        f'{nick}，{sch.get("at")} 了，{sch.get("note") or "该吃点东西了"}。',
+        metrics=metrics, items=items,
+        meta={"hint": "到点提醒只是通知，不会自动下单；要下单请说「确认下单」。"},
     )
 
 
@@ -95,19 +107,43 @@ def alert_meal_time(nearby: list[dict] | None = None, nick: str = "老大") -> d
 # confirm：下单确认闸（交互卡片，必须清晰可点、防误触）
 # ---------------------------------------------------------------------------
 def confirm_from_draft(draft: dict, draft_path: str = "") -> dict:
+    """下单确认卡：逐件列出商品（名称 × 数量 · 单价 · 小计）+ 券 + 门店 + 取餐方式。"""
     coupon = draft.get("coupon")
     saved = float(draft.get("discount") or 0)
-    items = [{"name": it.get("name") or it.get("productCode"),
-              "quantity": it.get("quantity"), "note": str(it.get("productCode") or "")}
-             for it in draft.get("items", [])]
+    items = []
+    for it in draft.get("items", []):
+        line = {
+            "name": it.get("name") or it.get("productCode"),
+            "quantity": it.get("quantity"),
+            "price": it.get("subtotal") if it.get("subtotal") is not None else None,
+            "note": _item_note(it),
+        }
+        items.append(line)
+
+    store_line = f'{draft.get("storeName") or draft.get("storeCode")}'
+    if draft.get("takeWayName"):
+        store_line += f'（{draft["takeWayName"]}）'
+    if coupon:
+        coupon_txt = coupon.get("name") or coupon.get("couponCode")
+        if coupon.get("expireAt"):
+            coupon_txt += f'（有效期至 {coupon["expireAt"]}）'
+    else:
+        coupon_txt = "未用券/积分"
+
+    metrics = [
+        {"label": "原价", "value": draft.get("originalPrice"), "unit": "元"},
+        {"label": "到手价", "value": draft.get("price"), "unit": "元", "emphasis": True},
+        {"label": "省", "value": saved, "unit": "元", "emphasis": True},
+    ]
+    sched = draft.get("scheduledFrom")
+    if sched:
+        metrics.insert(0, {"label": "到点时间", "value": sched.get("at") or "到点即取",
+                           "unit": "", "emphasis": True})
+
     return present.make_payload(
         "confirm", "下单确认",
         persona.confirm_gate(draft),
-        metrics=[
-            {"label": "原价", "value": draft.get("originalPrice"), "unit": "元"},
-            {"label": "到手价", "value": draft.get("price"), "unit": "元", "emphasis": True},
-            {"label": "省", "value": saved, "unit": "元", "emphasis": True},
-        ],
+        metrics=metrics,
         items=items,
         actions=[
             {"id": "confirm", "label": "确认下单", "style": "primary",
@@ -116,11 +152,27 @@ def confirm_from_draft(draft: dict, draft_path: str = "") -> dict:
         ],
         draft=draft,
         meta={
-            "hint": (f'用券「{coupon.get("name") or coupon.get("couponCode")}」；'
-                     if coupon else "本单未用券；") + "未收到你的明确确认前，我不会调用 create-order。",
+            "hint": f'{store_line}｜券：{coupon_txt}'
+                    + ("；到点任务已重新算价" if sched else "")
+                    + "。未收到你的明确确认前，我不会调用 create-order。",
             "trace": draft.get("savingDetail", ""),
         },
     )
+
+
+def _item_note(it: dict) -> str:
+    """商品行补充：官方规格名（与用户原话不同时）· 单价 · 原价小计。"""
+    parts = []
+    if it.get("officialName") and it["officialName"] != it.get("name"):
+        parts.append(str(it["officialName"]))
+    if it.get("unitPrice") is not None:
+        parts.append(f'单价 ¥{it["unitPrice"]:g}')
+    if it.get("originalSubtotal") is not None and it.get("subtotal") is not None:
+        if float(it["originalSubtotal"]) > float(it["subtotal"]):
+            parts.append(f'原价 ¥{it["originalSubtotal"]:g}')
+    if not parts and it.get("productCode"):
+        parts.append(str(it["productCode"]))
+    return " · ".join(parts)
 
 
 def confirm_candidates(track_a: dict, track_b: dict) -> dict:

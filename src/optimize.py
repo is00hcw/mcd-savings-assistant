@@ -158,7 +158,44 @@ def optimize(client, store_code: str, wanted: list[tuple[str, int]],
 
     take_way = _pick_take_way(best["result"])
     draft = _make_draft(store_code, items, best, take_way, track)
+    _attach_product_breakdown(draft, best["result"])
     return draft
+
+
+def _attach_product_breakdown(draft: dict, calc_result: dict):
+    """把 calculate-price 的 productList（单价/小计）回填进草稿商品行。
+
+    让确认卡与到点消息能逐件列出「名称 × 数量 · 单价 · 小计」，
+    用户一眼就能核对，而不只是看一个总价。
+    """
+    d = calc_result.get("data") if isinstance(calc_result, dict) else calc_result
+    d = d if isinstance(d, dict) else {}
+    plist = d.get("productList") or []
+    by_code = {}
+    for p in plist:
+        code = str(p.get("productCode") or "")
+        if code:
+            by_code[code] = p
+    for it in draft.get("items", []):
+        p = by_code.get(str(it.get("productCode") or ""))
+        if not p:
+            continue
+        qty = int(p.get("quantity") or it.get("quantity") or 1)
+        sub = p.get("subtotal")
+        orig_sub = p.get("originalSubtotal")
+        it["unitPrice"] = _fen2yuan(sub) / qty if sub not in (None, "") else None
+        it["subtotal"] = _fen2yuan(sub)
+        if orig_sub not in (None, ""):
+            it["originalSubtotal"] = _fen2yuan(orig_sub)
+        if p.get("productName") and p["productName"] != it.get("name"):
+            # 官方名更精确（如「薯条」实为「中薯条」），但保留用户原话避免看着陌生
+            it["officialName"] = p["productName"]
+    if d.get("storeName"):
+        draft["storeName"] = d["storeName"]
+    elif not draft.get("storeName") or draft["storeName"] == draft.get("storeCode"):
+        cached = price_memory.get_store_name(draft.get("storeCode") or "")
+        if cached:
+            draft["storeName"] = cached
 
 
 def _price_of(calc_result: dict) -> float:
@@ -209,6 +246,7 @@ def _make_draft(store_code: str, items: list[dict], best: dict,
             "couponId": str(coupon.get("id") or coupon.get("couponId") or ""),
             "couponCode": str(coupon.get("code") or coupon.get("couponCode") or ""),
             "name": coupon.get("title") or coupon.get("name") or coupon.get("couponName") or "",
+            "expireAt": (coupon.get("tradeEndDateTime") or coupon.get("tradeEndDate") or ""),
         } if coupon else None),
         "price": _fen2yuan(price),
         "originalPrice": _fen2yuan(orig),
