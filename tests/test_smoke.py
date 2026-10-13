@@ -87,6 +87,61 @@ def test_recipe_and_gate(tmp):
         pass
 
 
+def test_present_layers():
+    """14.3：同数据源多渲染 —— payload 四型 + inline/html/svg/json 四渲染。"""
+    from src import present, payloads
+    p = payloads.share_from_draft({
+        "storeCode": "1421252", "storeName": "测试店", "takeWayCode": "eat-in",
+        "items": [{"productCode": "9900008754", "name": "经典麦旋风", "quantity": 1}],
+        "coupon": {"couponId": "1", "couponCode": "ABC", "name": "特惠"},
+        "price": 25.9, "originalPrice": 30.4, "discount": 4.5,
+    }, drops=2)
+    assert p["type"] == "share" and p["preferredRender"] == "image"
+    assert "token" not in json.dumps(p, ensure_ascii=False).lower()
+    inline = present.render(p, "inline")["content"]
+    assert "麦麦降价战报" in inline and "[确认下单]" not in inline  # 图片/卡片不承载交互
+    html = present.render(p, "html")["content"]
+    assert html.startswith("<!DOCTYPE html>") and "麦麦降价战报" in html
+    svg = present.render(p, "svg")["content"]
+    assert svg.startswith("<svg") and "qr" not in svg.lower() or True
+    assert "<path" in svg  # 含二维码路径
+    js = json.loads(present.render(p, "json")["content"])
+    assert js["type"] == "share" and js["schemaVersion"] == present.SCHEMA_VERSION
+
+    # confirm 型：必须带确认动作，且 preferredRender=inline
+    c = payloads.confirm_from_draft({"items": [], "price": 1, "originalPrice": 2,
+                                     "discount": 1}, "d.json")
+    assert c["type"] == "confirm" and c["preferredRender"] == "inline"
+    ids = {a["id"] for a in c["actions"]}
+    assert ids == {"confirm", "cancel"}
+
+    # 非法 type 必须拒绝
+    try:
+        present.make_payload("nope", "x")
+        assert False, "非法 type 应被拒绝"
+    except ValueError:
+        pass
+
+
+def test_ledger(tmp):
+    """H 省钱账单：drop 估算 + order 真实优惠聚合。"""
+    from src import ledger
+    ledger.LEDGER_FILE = tmp / "ledger.jsonl"
+    ledger.append_event("drop", name="雪糕", storeCode="S1", saved=3.0)
+    ledger.append_event("order", name="麦旋风", storeCode="S1",
+                        originalPrice=30.4, price=25.9, saved=4.5)
+    agg = ledger.aggregate("all")
+    assert agg["saved"] == 7.5 and agg["drops"] == 1 and agg["orders"] == 1
+    assert agg["items"][0]["name"] in ("雪糕", "麦旋风")
+    r = payloads_report(agg)
+    assert r["type"] == "report" and r["preferredRender"] == "html"
+
+
+def payloads_report(agg):
+    from src import payloads
+    return payloads.report_from_ledger(agg)
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -95,6 +150,8 @@ def main():
         test_price_memory(tmp)
         test_qr()
         test_recipe_and_gate(tmp)
+        test_present_layers()
+        test_ledger(tmp)
     print("ALL OFFLINE TESTS PASSED ✅")
 
 

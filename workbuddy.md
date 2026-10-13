@@ -47,6 +47,43 @@
 2. 业务的错误信封（success:false）原样透传导致静默 0 元 → 客户端层统一转异常。
 3. f-string `{:>8:g}` 非法 → `{:>8.2f}`。
 
+## v0.15 增量：14.3 输出展示形态规范（同数据源多渲染）
+
+方案升级到 v0.15 后新增 14.3，原实现是「直接打印文本 + 生成 HTML」，缺少统一结构化层。
+本轮把输出层重做为可插拔架构：
+
+- **新增 `src/present.py`**（渲染层）：payload schema + 四渲染器
+  （inline 卡片 / html 页面 / svg 图片 / json 兜底），`render(payload, fmt)` 单一入口。
+- **新增 `src/payloads.py`**（映射层）：业务对象 → payload。
+  alert: 降价提醒 / 领券回执 / 积分临期 / 可领券；confirm: 下单确认闸 + 双轨候选；
+  report: 省钱账单；share: 战报（带 order recipe）。
+- **新增 `src/ledger.py`**（账本）：`~/.mcd-skill/ledger.jsonl`，
+  drop=盯价估算省额、order=真实优惠，为 H 模块提供可聚合数据源。
+- **CLI 全量改造**：所有命令统一 `--format inline|json|html|svg`；
+  新增 `report`、`render` 命令；`coupons` 改为**默认只读预览**，
+  需 `--claim --yes` 才写账户（比原方案更保守，也更符合 15.4 安全边界）。
+
+四条原则落到代码：
+
+| 原则 | 落地 |
+| --- | --- |
+| ① 同数据源多渲染 | payload 里只放数据 + type，不含任何 HTML 片段 |
+| ② 组件优先于 HTML | alert/confirm 默认 inline，不生成文件 |
+| ③ 跨宿主降级 | inline 即 Markdown，纯 CLI 也能完整显示 |
+| ④ 图片不用于交互 | svg 只含展示信息；确认动作只出现在 actions[] |
+
+踩坑修复（4 处）：
+
+1. `render_svg` 首版残留废弃的两段式布局逻辑（全局变量 H_BODY_H），重写为「先量高度再输出」单遍。
+2. SVG 首个指标与摘要行重叠（y=96 vs y=90）→ 指标起点下移至 y=128，目视校验通过。
+3. 确认卡里商品名显示成 code → `optimize.build_items` 回填 name（calculate-price 忽略多余字段）。
+4. `coupons`/`patrol` 把「已领取」的券也算进可领数 → 按 label 过滤 HAVING_RECEIVE。
+
+实测（只读，未下单/未领券）：patrol → 3 张 alert 卡；best → confirm 卡带 [确认下单]/[再想想]；
+report → HTML 账单；share → SVG 战报（二维码可扫，目视校验版式）；
+`order` 无 `--yes` 仍按红线拒绝（exit 4）。离线测试从 5 组扩到 7 组，新增
+present 四渲染 + confirm 动作完整性 + ledger 聚合。
+
 ## 设计取舍
 
 - **零第三方依赖**：QR 码自研（v1–5 单块）换取 clone 即用；配方 JSON 压缩到 106 字节内。

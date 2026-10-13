@@ -60,6 +60,19 @@ def execute_draft(client, draft: dict) -> dict:
         "result": result,
     }
     _log_receipt(receipt)
+    # 真实优惠入账本（精确值：原价-实付）
+    try:
+        from . import ledger
+        ledger.append_event(
+            "order", storeCode=draft.get("storeCode"),
+            name=",".join(str(it.get("name") or it.get("productCode"))
+                          for it in draft.get("items", [])),
+            originalPrice=draft.get("originalPrice"), price=draft.get("price"),
+            saved=round(float(draft.get("discount") or 0), 2),
+            takeWay=draft.get("takeWayCode"),
+        )
+    except Exception:
+        pass  # 账本失败不影响下单结果
     return receipt
 
 

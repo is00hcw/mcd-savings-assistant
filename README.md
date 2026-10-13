@@ -10,10 +10,34 @@
 | ✅ 全自动（不用你管） | 🔒 需你一键确认（花钱动作） |
 | --- | --- |
 | 盯价巡检：常去门店菜单快照 + 跨期/跨店比价，检出「新低/降价」 | 下单 `create-order`（展示草稿 → 你确认 → 才执行） |
-| 自动领券：一键领取麦麦省可领券（免费动作，留回执） | 积分兑换 `mall-create-order` |
-| 算价：带券枚举，线性挑出最低到手价（积分券每单限 1 张、不叠加） | 取消订单 / 抽奖 |
+| 可领券预览（默认只读，不动账户） | 积分兑换 `mall-create-order` |
+| 领券：显式 `--claim --yes` 才写账户，免费动作留回执 | 取消订单 / 抽奖 |
+| 算价：带券枚举，线性挑出最低到手价（积分券每单限 1 张、不叠加） | |
 | 临期积分提醒 + 常买商品 Top3 统计 | |
-| 省钱战报卡：省 X 元 / 抓 Y 次降价，可截图分享（配方不含任何凭据） | |
+| 省钱账单与战报：省 X 元 / 抓 Y 次降价，可截图分享（配方不含任何凭据） | |
+
+## 输出形态（三层，同数据源多渲染）
+
+核心逻辑只产出**结构化 payload**（带 `type` 字段），渲染层可插拔：
+
+| type | 场景 | 形态 | 命令 |
+| --- | --- | --- | --- |
+| `alert` | 降价提醒 / 领券回执 / 到点提醒 / 积分临期 | 内联卡片（对话流内直接看） | `patrol` / `coupons` |
+| `confirm` | 下单确认闸 / 双轨候选二选一 | 交互卡片（确认/取消按钮） | `best` |
+| `report` | 省钱账单（细看/存档） | HTML 页面 | `report` |
+| `share` | 省钱战报（对外转发） | 图片 SVG | `share` |
+
+每个命令都支持 `--format inline|json|html|svg`，例如：
+
+```bash
+python main.py patrol  --format inline           # 内联卡片（默认，任何宿主可渲染）
+python main.py best    --format json             # 拿结构化 payload 自己渲染
+python main.py report  --format html --out bill.html
+python main.py share   --format svg  --out war.svg
+python main.py render  --payload pay.json --format html   # 渲染层可插拔验证
+```
+
+设计原则：**图片只用于分享、不用于交互**——确认闸永远是卡片/按钮，绝不靠图片。
 
 ## 快速开始（<2 分钟）
 
@@ -24,7 +48,7 @@ cp config.example.json config.local.json
 #   1. mcp_token 填你的麦当劳 MCP Token（https://open.mcd.cn/mcp 手机号登录领取，免费）
 #   2. user.default_address 填常用地址（查附近门店用）
 python main.py warmup    # 首启热身：导入历史订单，建低价档案 + 常买 Top3
-python main.py patrol    # 盯价巡检：降价 / 低价 / 可领券 / 临期积分
+python main.py patrol    # 盯价巡检：降价 / 低价 / 可领券 / 临期积分（alert 卡片）
 ```
 
 要求：Python 3.9+（WorkBuddy 内置解释器开箱即用），**零第三方依赖**，纯标准库。
@@ -33,15 +57,17 @@ python main.py patrol    # 盯价巡检：降价 / 低价 / 可领券 / 临期�
 
 ```bash
 python main.py warmup                        # 冷启动：订单导入，建低价基线
-python main.py patrol                        # 巡检：降价/新低/可领券/临期积分
+python main.py patrol                        # 巡检：降价/新低/可领券/临期积分 → alert 卡
 python main.py stores --address "深圳市南山区科技园"   # 查附近门店
 python main.py meals --store <storeCode> --save      # 看某店菜单优惠价（--save 刷新基线）
-python main.py coupons                       # 一键领券（免费写，留回执）
+python main.py coupons                       # 可领券预览（只读，不动账户）
+python main.py coupons --claim --yes         # 一键领券（免费写，留回执）
 python main.py best --store <code> --items "经典麦旋风 x1" [--track global|top3]
-                                             # 带券枚举算最低价，产出订单草稿（只读）
+                                             # 带券枚举算最低价，产出 confirm 确认卡（只读）
 python main.py order --draft <draft.json> --yes --confirm-text "确认下单"
                                              # ⚠️ 红线：必须你本人确认后才执行
-python main.py share --draft <draft.json>    # 生成省钱战报卡 + 好友复现提示词
+python main.py report --period month          # 省钱账单 → HTML 页面
+python main.py share --draft <draft.json>     # 省钱战报 → 图片 + 好友复现提示词
 python main.py raw --tool query-my-account   # 调试：直接调任意只读工具
 ```
 

@@ -54,6 +54,30 @@
    但**未暴露适用商品 code 清单**——「券×商品」匹配只能靠算价试探。
 6. 同商品跨店 code 不同（如「吉士蛋麦满分组合」两店 code 不同），归一化主键必须用 name。
 
+## 结构化输出（14.3）
+
+所有命令先产出统一 payload，再按 `--format` 渲染，三层形态同数据源：
+
+```
+payload = {schemaVersion, type: alert|confirm|report|share, preferredRender,
+           ts, title, summary, metrics[], items[], actions[],
+           draft?, recipe?, meta{}}
+```
+
+| type | 场景 | preferredRender | 产出命令 |
+| --- | --- | --- | --- |
+| `alert` | 降价提醒 / 领券回执 / 到点提醒 / 积分临期 | inline（内联卡片） | `patrol`、`coupons` |
+| `confirm` | 下单确认闸 / 双轨候选 | inline（交互卡片） | `best` |
+| `report` | 省钱账单 | html | `report` |
+| `share` | 省钱战报 | svg（图片） | `share` |
+
+渲染器：`present.render_inline / render_html / render_svg / json`，
+`present.render(payload, fmt)` 为唯一入口，`main.py render --payload … --format …` 可验证可插拔性。
+图片只承载分享信息，**不含任何可点确认元素**；确认闸只走卡片/动作（`actions[].command`）。
+
+账本（H 模块数据源）：`~/.mcd-skill/ledger.jsonl`，`drop`=盯价发现（估算省额）、
+`order`=确认下单后（真实优惠），由 `ledger.aggregate(period)` 聚合为 report payload。
+
 ## 安全边界
 
 - 读写白名单硬编码在 `src/mcd_client.py`：`MONEY_WRITE` 集合的工具在客户端层

@@ -6,10 +6,11 @@
 """
 from .config import get_config
 from .normalize import meal_index_from_query_meals
-from . import price_memory
+from . import price_memory, ledger
 
 
-def scan_stores(client, store_codes: list[str] | None = None) -> dict:
+def scan_stores(client, store_codes: list[str] | None = None,
+                record_ledger: bool = True) -> dict:
     """巡检若干门店，返回巡检报告（不触发任何写操作）。"""
     cfg = get_config()
     codes = list(store_codes or cfg.favorite_stores)[: cfg.scan_store_limit]
@@ -93,6 +94,23 @@ def scan_stores(client, store_codes: list[str] | None = None) -> dict:
         report["priceEvents"].extend(events)
         price_memory.save_snapshot(code, idx)
         price_memory.merge_profile_from_meals(idx, code)
+
+        # 降价事件入账本（H 省钱账单数据源，估算值）
+        if record_ledger:
+            for ev in events:
+                if ev.get("type") not in ("new_low", "dropped"):
+                    continue
+                prev = float(ev.get("prevMin") or ev.get("prev") or 0)
+                cur = float(ev.get("currentPrice") or 0)
+                if prev and cur and prev > cur:
+                    try:
+                        ledger.append_event(
+                            "drop", name=ev.get("name"), storeCode=code,
+                            prevPrice=prev, price=cur, saved=round(prev - cur, 2),
+                            source=ev.get("type"),
+                        )
+                    except Exception:
+                        pass  # 账本失败不影响巡检主流程
 
         # 跨店最便宜登记
         for k, m in idx.items():

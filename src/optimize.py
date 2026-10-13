@@ -15,25 +15,31 @@ def build_items(client, store_code: str, wanted: list[tuple[str, int]]) -> list[
     """把 [(商品名或code, 数量)] 解析为 calculate-price 的 items。
 
     商品名会先在该店菜单内按归一化 name 查 code（code 是门店内下单凭证）。
+    同时把商品名回填进 items（供确认卡/战报卡展示，calculate-price 忽略多余字段）。
     """
-    menu_codes = _menu_code_map(client, store_code)
+    menu = _menu_index(client, store_code)
+    menu_codes = {k: str(m.get("code")) for k, m in menu.items() if m.get("code")}
     items = []
     for name_or_code, qty in wanted:
-        code = name_or_code
-        if not code.isdigit():
-            code = menu_codes.get(normalize_name(name_or_code))
+        code, label = name_or_code, None
+        if not name_or_code.isdigit():
+            key = normalize_name(name_or_code)
+            code = menu_codes.get(key)
             if not code:
                 raise ValueError(f"门店 {store_code} 菜单中找不到商品: {name_or_code}")
-        items.append({"productCode": code, "quantity": int(qty)})
+            label = (menu.get(key) or {}).get("name") or name_or_code
+        item = {"productCode": code, "quantity": int(qty)}
+        if label:
+            item["name"] = label
+        items.append(item)
     return items
 
 
-def _menu_code_map(client, store_code: str) -> dict[str, str]:
+def _menu_index(client, store_code: str) -> dict[str, dict]:
     meals_raw = client.meals(store_code)
     md = meals_raw.get("data") if isinstance(meals_raw, dict) else meals_raw
     from .normalize import meal_index_from_query_meals
-    idx = meal_index_from_query_meals(md if isinstance(md, dict) else {})
-    return {k: str(m.get("code")) for k, m in idx.items() if m.get("code")}
+    return meal_index_from_query_meals(md if isinstance(md, dict) else {})
 
 
 def _coupon_candidates(client, store_code: str) -> list[dict]:
@@ -90,8 +96,8 @@ def optimize(client, store_code: str, wanted: list[tuple[str, int]],
     """
     if track == "top3":
         tops = price_memory.top_products(3)
-        menu_codes = _menu_code_map(client, store_code)
-        wanted = [(k, q) for k, _ in tops for q in [1] if k in menu_codes]
+        menu = _menu_index(client, store_code)
+        wanted = [(k, 1) for k, _ in tops if k in menu]
         if not wanted:
             raise ValueError("Top3 常买商品在该店菜单中均不可买，改用 --track global")
 
