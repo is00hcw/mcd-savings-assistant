@@ -20,3 +20,6 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# WorkBuddy 本地记忆目录（非交付物）
+.workbuddy/
