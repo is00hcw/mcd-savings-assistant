@@ -23,3 +23,7 @@ Thumbs.db
 
 # WorkBuddy 本地记忆目录（非交付物）
 .workbuddy/
+
+# 运行时日志
+*.log
+excalidraw.log
