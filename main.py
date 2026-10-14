@@ -63,13 +63,13 @@ def cmd_schedule(args):
     act = args.action
     if act == "add":
         try:
-            sch.add(kind=args.kind, at=args.at, store=args.store or "",
-                    items=args.items or "", track=args.track,
-                    coupon=args.coupon, note=args.note, days=args.days)
+            created = sch.add(kind=args.kind, at=args.at, store=args.store or "",
+                              items=args.items or "", track=args.track,
+                              coupon=args.coupon, note=args.note, days=args.days)
         except ValueError as e:
             print(f"[schedule] {e}")
             sys.exit(1)
-        print(f"✅ 已登记：{sch.describe(sch.list_all()[-1])}")
+        print(f"✅ 已登记：{sch.describe(created)}")
         print("⛔ 到点只会给你推确认消息，绝不会自动下单。")
         print("（到点确认后按**当下价格**下即时单，不做预约单；--at 是触发提醒时间）")
         print("（到点触发：python main.py schedule due --fire）")
@@ -108,6 +108,9 @@ def cmd_schedule(args):
                 r = sch.fire(client, s)
             except Exception as e:
                 print(f"  ❌ {s['id']} 触发失败：{e}")
+                continue
+            if r.get("skipped"):
+                print(f"  ⏭️ {s['id']} 已跳过：{r.get('reason') or '任务状态已变化'}")
                 continue
             print()
             print(f"--- 推送内容（{s['id']}）---")
@@ -159,7 +162,9 @@ def cmd_phrase(args):
         argv = ph.build_argv(hit["cmd"], store=args.store, item=args.item,
                              draft=args.draft,
                              address_id=getattr(args, "address_id", ""))
-        subprocess.run(argv)  # 无 shell
+        completed = subprocess.run(argv)  # 无 shell
+        if completed.returncode:
+            sys.exit(completed.returncode)
 
 
 def cmd_init(args):
@@ -344,7 +349,7 @@ def cmd_delivery(args):
         return
     print(f"该地址可配送到 {len(stores)} 家门店：")
     for s in stores:
-        status = "营业中" if s.get("businessStatus") else "休息中"
+        status = "营业中" if optimize._store_open(s) else "休息中"
         print(f"  {s.get('storeName')}  storeCode={s.get('storeCode')}"
               f"  beCode={s.get('beCode')}  [{status}]")
     print()
@@ -409,21 +414,34 @@ def cmd_coupons(args):
 def cmd_best(args):
     """D 最优下单 → confirm payload（确认闸交互卡片）。到店自提或麦乐送外卖。"""
     wanted = []
-    for part in args.items.split(","):
-        p = part.strip()
-        if not p:
-            continue
-        if "x" in p.lower():
-            name, qty = p.lower().split("x", 1)
-            wanted.append((name.strip(), int(qty or 1)))
-        else:
-            wanted.append((p, 1))
+    try:
+        for part in args.items.split(","):
+            p = part.strip()
+            if not p:
+                continue
+            if "x" in p.lower():
+                name, qty = p.lower().split("x", 1)
+                qty = int(qty.strip())
+                if not name.strip() or qty <= 0:
+                    raise ValueError
+                wanted.append((name.strip(), qty))
+            else:
+                wanted.append((p, 1))
+    except ValueError:
+        print("商品格式无效：请使用“商品名 x正整数”，例如“麦旋风 x1”")
+        sys.exit(1)
+    if not wanted:
+        print("至少需要指定一个商品")
+        sys.exit(1)
     client = _client()
     store_code = args.store
     delivery = None
     if args.delivery:
         if not args.address_id:
             print("外卖需要配送地址：先 python main.py delivery 查地址，再 --address-id <id>")
+            sys.exit(1)
+        if args.be_code and not args.store:
+            print("外卖单独指定 --be-code 时必须同时指定 --store，以校验业务码归属")
             sys.exit(1)
         try:
             # --store 与 --be-code 同时指定时也必须过校验：
@@ -479,15 +497,20 @@ def cmd_best(args):
         if extra_draft_path:
             confirm_payload["top3DraftPath"] = extra_draft_path
         text = json.dumps(confirm_payload, ensure_ascii=False, indent=2)
+        envelope = {
+            "payload": confirm_payload,
+            "saved": bool(args.out),
+            "payloadPath": None,
+            "draftPath": str(path),
+            "top3DraftPath": extra_draft_path or None,
+        }
         if args.out:
             out = Path(args.out)
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(text, encoding="utf-8")
-            # json 模式 stdout 仍只输出一个 JSON 对象（不混入文本提示）
-            print(json.dumps({"saved": True, "payloadPath": str(out.resolve()),
-                              "draftPath": str(path)}, ensure_ascii=False))
-        else:
-            print(text)
+            envelope["payloadPath"] = str(out.resolve())
+        # 无论是否 --out，stdout 都是同一套 envelope，避免脚本调用者分支解析。
+        print(json.dumps(envelope, ensure_ascii=False, indent=2))
         return
     _show(confirm_payload, args, out=args.out)
     if not (args.out and args.format in ("html", "svg")):

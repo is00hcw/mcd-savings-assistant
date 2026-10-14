@@ -140,7 +140,16 @@ def add(kind: str = KIND_ORDER, at: str = "", store: str = "", items: str = "",
     at  : "18:30"（每日到点）或 "2026-10-13 18:30"（指定日期到点）
     days: 连续重复天数（0=仅一次；>0 从今天起每天到点触发）
     """
+    if kind not in (KIND_ORDER, KIND_ALERT):
+        raise ValueError(f"任务类型不支持: {kind!r}")
+    if int(days or 0) < 0:
+        raise ValueError("--days 不能为负数")
     spec = parse_at(at)
+    if kind == KIND_ORDER:
+        if not str(store or "").strip():
+            raise ValueError("order 定时任务必须指定 --store")
+        if not _parse_items(items):
+            raise ValueError("order 定时任务必须指定至少一个商品")
     sch = {
         "id": "sch-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"),
         "kind": kind, "at": spec["raw"], "time": spec["time"], "date": spec["date"],
@@ -194,8 +203,14 @@ def parse_at(at: str) -> dict:
     if not m:
         raise ValueError(f"时间格式无法解析: {at!r}（应为 HH:MM 或 YYYY-MM-DD HH:MM）")
     date, hh, mm, ss = m.groups()
-    if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59):
+    if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59 and
+            0 <= int(ss or 0) <= 59):
         raise ValueError(f"时间超出范围: {at!r}")
+    if date:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(f"日期格式或日期值无效: {at!r}") from None
     return {"raw": raw, "date": date or None,
             "time": f"{int(hh):02d}:{int(mm):02d}:{int(ss or 0):02d}"}
 
@@ -425,7 +440,13 @@ def _parse_items(s: str) -> list[tuple[str, int]]:
             continue
         if "x" in p.lower():
             name, qty = p.lower().split("x", 1)
-            out.append((name.strip(), int(qty or 1)))
+            try:
+                count = int(qty.strip())
+            except ValueError:
+                raise ValueError(f"商品数量必须是正整数: {p!r}") from None
+            if not name.strip() or count <= 0:
+                raise ValueError(f"商品名称不能为空且数量必须为正整数: {p!r}")
+            out.append((name.strip(), count))
         else:
             out.append((p, 1))
     return out

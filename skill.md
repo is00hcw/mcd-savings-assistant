@@ -112,10 +112,14 @@ CLI 的一切输出都是**结构化 payload**，带 `type` 字段：
 
 ```bash
 --format inline   # 内联卡片（Markdown 兜底，任何宿主都能渲染；默认）
---format json     # 结构化 payload 原文（你要二次加工时用这个）
+--format json     # JSON 输出；best 使用固定 envelope，见下文
 --format html     # 完整 HTML 页面
 --format svg      # 图片（分享用，不承载交互）
 ```
+
+`best --format json` 无论是否传 `--out`，stdout 均为同一 JSON envelope：
+`payload` 为确认卡数据，`saved` 表示是否另存 payload，`payloadPath` 未保存时为 `null`，
+`draftPath` 为待确认草稿路径，`top3DraftPath` 在双轨模式提供、单轨时为 `null`。
 
 过程型命令（`schedule` / `order` / `meals` / `stores` / `warmup` / `raw`）不产 payload，
 输出文本进度或原始 JSON，**没有** `--format` 参数。

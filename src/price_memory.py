@@ -16,6 +16,7 @@ from .normalize import normalize_name
 BASELINE_FILE = CACHE_DIR / "price_baseline.json"
 PROFILE_FILE = CACHE_DIR / "product_profile.json"
 STORE_NAMES_FILE = CACHE_DIR / "store_names.json"
+PROCESSED_ORDERS_FILE = CACHE_DIR / "processed_order_ids.json"
 SNAPSHOT_DIR = CACHE_DIR / "meals_snapshot"
 SNAPSHOT_TTL = 6 * 3600  # 菜单快照 6 小时
 
@@ -116,6 +117,20 @@ def cold_start_from_orders(client) -> dict:
     返回 {profile, discounted_names}。
     """
     profile = load_profile()
+    has_processed_ledger = PROCESSED_ORDERS_FILE.exists()
+    has_existing_counts = False
+    for rec in profile.values():
+        if not isinstance(rec, dict):
+            continue
+        try:
+            has_existing_counts = int(rec.get("buyCount") or 0) > 0
+        except (TypeError, ValueError):
+            continue
+        if has_existing_counts:
+            break
+    legacy_profile = not has_processed_ledger and has_existing_counts
+    processed = set(str(x) for x in (_load(PROCESSED_ORDERS_FILE, []) or []))
+    processed_now = set(processed)
     discounted: set[str] = set()
     order_stores: list[str] = []   # 订单里出现过的门店（按频次），用于推导常去门店
     try:
@@ -133,13 +148,20 @@ def cold_start_from_orders(client) -> dict:
         oid = od.get("orderId") or od.get("orderNo") or od.get("id")
         if not oid:
             continue
+        oid = str(oid)
+        if oid in processed:
+            continue
+        if legacy_profile:
+            processed_now.add(oid)
+            continue
         try:
-            detail = client.query_order(str(oid))
+            detail = client.query_order(oid)
         except Exception:
             continue
         dd = detail.get("data") if isinstance(detail, dict) else detail
         if not isinstance(dd, dict):
             continue
+        processed_now.add(oid)
         try:
             has_discount = float(dd.get("totalDiscountAmount") or 0) > 0
         except (TypeError, ValueError):
@@ -154,6 +176,8 @@ def cold_start_from_orders(client) -> dict:
             if has_discount:
                 discounted.add(key)
     save_profile(profile)
+    if processed_now != processed:
+        _save(PROCESSED_ORDERS_FILE, sorted(processed_now))
     return {"profile": profile, "discounted_names": sorted(discounted),
             "orderStores": order_stores}
 

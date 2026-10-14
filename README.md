@@ -52,6 +52,10 @@ python main.py share   --format svg  --out war.svg
 python main.py render  --payload pay.json --format html   # 渲染层可插拔验证
 ```
 
+`best --format json` 的 stdout 固定为 JSON envelope，是否提供 `--out` 都保持相同结构：
+`payload` 是确认卡数据，`saved` 表示是否另存 payload，`payloadPath` 未保存时为 `null`，
+`draftPath` 指向待确认草稿，双轨模式还会提供 `top3DraftPath`（单轨时为 `null`）。
+
 过程型命令（`schedule` / `order` / `meals` / `stores` / `warmup` / `raw`）不产 payload，
 输出文本进度或原始 JSON，**没有** `--format` 参数。
 

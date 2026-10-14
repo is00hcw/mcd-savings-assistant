@@ -45,6 +45,80 @@ def test_price_memory(tmp):
     assert events2 and events2[0]["type"] == "at_low"
 
 
+def test_warmup_order_import_is_idempotent():
+    """重复 warmup 不重复累计成功导入的订单，失败详情会在下次重试。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        old_profile = price_memory.PROFILE_FILE
+        old_processed = price_memory.PROCESSED_ORDERS_FILE
+        old_store_names = price_memory.STORE_NAMES_FILE
+        price_memory.PROFILE_FILE = tmp / "profile.json"
+        price_memory.PROCESSED_ORDERS_FILE = tmp / "processed.json"
+        price_memory.STORE_NAMES_FILE = tmp / "stores.json"
+
+        class Client:
+            def __init__(self):
+                self.detail_calls = {}
+
+            def order_list(self):
+                return {"data": {"list": [
+                    {"orderId": "ok-1", "storeCode": "S1", "storeName": "门店"},
+                    {"orderId": "retry-1", "storeCode": "S1"},
+                ]}}
+
+            def query_order(self, oid):
+                self.detail_calls[oid] = self.detail_calls.get(oid, 0) + 1
+                if oid == "retry-1" and self.detail_calls[oid] == 1:
+                    raise RuntimeError("temporary failure")
+                return {"data": {"totalDiscountAmount": 1,
+                                 "orderProductList": [{"productName": "麦旋风", "quantity": 2}]}}
+
+        try:
+            client = Client()
+            first = price_memory.cold_start_from_orders(client)
+            assert first["profile"]["麦旋风"]["buyCount"] == 2
+            assert client.detail_calls == {"ok-1": 1, "retry-1": 1}
+            second = price_memory.cold_start_from_orders(client)
+            assert second["profile"]["麦旋风"]["buyCount"] == 4
+            assert client.detail_calls == {"ok-1": 1, "retry-1": 2}
+            third = price_memory.cold_start_from_orders(client)
+            assert third["profile"]["麦旋风"]["buyCount"] == 4
+            assert client.detail_calls == {"ok-1": 1, "retry-1": 2}
+        finally:
+            price_memory.PROFILE_FILE = old_profile
+            price_memory.PROCESSED_ORDERS_FILE = old_processed
+            price_memory.STORE_NAMES_FILE = old_store_names
+
+
+def test_warmup_migrates_legacy_profile_without_recounting():
+    """已有购买计数但尚无订单账本的旧档案，初始化账本时不重复累计。"""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        old_profile = price_memory.PROFILE_FILE
+        old_processed = price_memory.PROCESSED_ORDERS_FILE
+        old_store_names = price_memory.STORE_NAMES_FILE
+        price_memory.PROFILE_FILE = tmp / "profile.json"
+        price_memory.PROCESSED_ORDERS_FILE = tmp / "processed.json"
+        price_memory.STORE_NAMES_FILE = tmp / "stores.json"
+        price_memory.save_profile({"麦旋风": {"aliases": [], "buyCount": 5, "storeCodes": []}})
+
+        class Client:
+            def order_list(self):
+                return {"data": {"list": [{"orderId": "old-order", "storeCode": "S1"}]}}
+
+            def query_order(self, oid):
+                raise AssertionError("旧订单不应再次导入")
+
+        try:
+            result = price_memory.cold_start_from_orders(Client())
+            assert result["profile"]["麦旋风"]["buyCount"] == 5
+            assert json.loads(price_memory.PROCESSED_ORDERS_FILE.read_text(encoding="utf-8")) == ["old-order"]
+        finally:
+            price_memory.PROFILE_FILE = old_profile
+            price_memory.PROCESSED_ORDERS_FILE = old_processed
+            price_memory.STORE_NAMES_FILE = old_store_names
+
+
 def test_qr():
     m = qr_matrix("HELLO MCD")
     size = len(m)
@@ -289,7 +363,8 @@ def test_schedule():
     # 时间解析
     assert sch.parse_at("18:30")["time"] == "18:30:00"
     assert sch.parse_at("2026-10-13 07:05")["date"] == "2026-10-13"
-    for bad in ("25:00", "abc", "18:99", ""):
+    assert sch.parse_at("18:30:59")["time"] == "18:30:59"
+    for bad in ("25:00", "abc", "18:99", "18:30:99", "2026-02-30 08:00", ""):
         try:
             sch.parse_at(bad)
             assert False, f"非法时间应被拒绝: {bad}"
@@ -302,6 +377,22 @@ def test_schedule():
         sch.OUTBOX_DIR = tmp / "outbox"
         sch.FIRE_LOCK_FILE = tmp / ".fire.lock"
         order_exec.DRAFT_DIR = tmp / "drafts"
+
+        for kwargs in (
+            {"kind": "invalid", "at": "08:00"},
+            {"kind": "order", "at": "08:00"},
+            {"kind": "order", "at": "08:00", "store": "S", "items": ""},
+            {"kind": "order", "at": "08:00", "store": "S", "items": "麦旋风 x0"},
+            {"kind": "order", "at": "08:00", "store": "S", "items": "麦旋风 x-1"},
+            {"kind": "order", "at": "08:00", "store": "S", "items": "麦旋风 xabc"},
+            {"kind": "order", "at": "08:00", "store": "S", "items": "x1"},
+            {"kind": "alert", "at": "08:00", "days": -1},
+        ):
+            try:
+                sch.add(**kwargs)
+                assert False, f"非法定时任务应拒绝: {kwargs}"
+            except ValueError:
+                pass
 
         s = sch.add(kind="order", at="08:00", store="1421252", items="麦旋风 x1", note="早餐")
         assert s["status"] == "pending"
@@ -1161,6 +1252,53 @@ def test_build_argv_no_shell():
     assert argv4 == ["python", "main.py", "share"]
 
 
+def test_phrase_propagates_exit_code():
+    """phrase --run 应将只读子命令的失败码传回调用方。"""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import main
+
+    args = SimpleNamespace(text="麦当劳有什么优惠", run=True, store="", item="",
+                           draft="", address_id="")
+    with patch("subprocess.run", return_value=SimpleNamespace(returncode=7)) as run:
+        try:
+            main.cmd_phrase(args)
+            assert False, "子进程失败码必须传递"
+        except SystemExit as e:
+            assert e.code == 7
+        run.assert_called_once()
+
+
+def test_schedule_due_skipped_result():
+    """定时任务被并发状态跳过时不访问成功结果字段。"""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from src import schedule
+    import main
+
+    args = SimpleNamespace(action="due", fire=True, pending=False)
+    with patch.object(schedule, "due", return_value=[{"id": "sch-race"}]), \
+            patch.object(schedule, "fire", return_value={"skipped": True, "reason": "already claimed"}), \
+            patch.object(main, "_client", return_value=object()):
+        main.cmd_schedule(args)
+
+
+def test_best_rejects_invalid_quantities():
+    """best CLI 商品数量必须为正整数，并在联网前拒绝输入错误。"""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import main
+
+    for items in ("麦旋风 x0", "麦旋风 x-1", "麦旋风 xabc", "x1", " , "):
+        args = SimpleNamespace(items=items)
+        with patch.object(main, "_client", side_effect=AssertionError("不应访问客户端")):
+            try:
+                main.cmd_best(args)
+                assert False, f"非法商品数量应拒绝: {items}"
+            except SystemExit as e:
+                assert e.code == 1
+
+
 def test_raw_readonly_gate():
     """raw 调试入口只放行 READ_ONLY：免费写（领券/建地址）与花钱动作一律拦截。"""
     import main as m
@@ -1509,6 +1647,8 @@ def main():
         test_normalize()
         test_meal_index()
         test_price_memory(tmp)
+        test_warmup_order_import_is_idempotent()
+        test_warmup_migrates_legacy_profile_without_recounting()
         test_qr()
         test_recipe_and_gate(tmp)
         test_present_layers()
@@ -1539,6 +1679,9 @@ def main():
         test_digest_covers_full_items()
         test_digest_covers_request_fields()
         test_build_argv_no_shell()
+        test_phrase_propagates_exit_code()
+        test_schedule_due_skipped_result()
+        test_best_rejects_invalid_quantities()
         test_raw_readonly_gate()
         test_lock_error_semantics()
         test_reprice_preserves_items()
