@@ -12,6 +12,8 @@ Token 读取顺序：环境变量 MCD_MCP_TOKEN > config.local.json（已 gitign
 红线：create-order 必须先 `best` 生成草稿 → 用户明确确认 →
 `order --draft <file> --yes --confirm-text "..."` 执行。
 """
+from __future__ import annotations
+
 import argparse
 import json
 import sys
@@ -28,9 +30,23 @@ from src.mcd_client import (McdClient, McpError,          # noqa: E402
                             READ_ONLY, FREE_WRITE, MONEY_WRITE)
 from src import (price_memory, perceive, optimize,     # noqa: E402
                  coupons as coupons_mod, order_exec, persona, payloads,
-                 present, ledger, share_card, address, onboarding)
+                 present, ledger, share_card, address, onboarding, local_data)
 
 FORMATS = ("inline", "json", "html", "svg")
+
+
+def _configure_output_encoding() -> None:
+    """让 CLI 被直接导入调用时也不会因 Windows 代码页无法编码 emoji 而崩溃。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(errors="backslashreplace")
+            except (OSError, ValueError):
+                pass
+
+
+_configure_output_encoding()
 
 
 def _client() -> McdClient:
@@ -157,6 +173,17 @@ def cmd_phrase(args):
         print("⛔ 该意图涉及写入/花钱动作，需用户本人明确确认后才执行，这里只回显命令。")
         return
     if args.run:
+        required = []
+        command = hit["cmd"]
+        if "<门店code>" in command and not args.store:
+            required.append("--store 门店code")
+        if "<商品>" in command and not args.item:
+            required.append("--item 商品名")
+        if "<地址id>" in command and not getattr(args, "address_id", ""):
+            required.append("--address-id 配送地址id")
+        if required:
+            print("执行前还需要你提供：" + "、".join(required))
+            return
         print("→ 立即执行：")
         import subprocess
         argv = ph.build_argv(hit["cmd"], store=args.store, item=args.item,
@@ -265,8 +292,11 @@ def cmd_patrol(args):
     """B 主动感知：巡检 → alert payload（内联卡片）。"""
     report = perceive.scan_stores(_client(), args.stores or None)
     nick = get_config().nickname
-    scanned = len(report.get("scannedStores") or [])
-    payloads_out = [payloads.alert_price_drop(report["priceEvents"], nick, scanned)]
+    store_results = report.get("scannedStores") or []
+    scanned = sum(1 for store in store_results if not store.get("error"))
+    scan_errors = sum(1 for store in store_results if store.get("error"))
+    payloads_out = [payloads.alert_price_drop(
+        report["priceEvents"], nick, scanned, scan_errors)]
     ep = payloads.alert_expiring_points(report.get("expirePoints"), nick)
     if ep:
         payloads_out.append(ep)
@@ -565,6 +595,8 @@ def cmd_order(args):
     receipt = order_exec.execute_draft(client, draft)
     if receipt.get("status") == "uncertain":
         print("⚠️ 下单结果不确定（网络层错误），未入账本，也请不要重复执行下单：")
+        if not receipt.get("receiptLogRecorded", True):
+            print("本地回执日志写入失败；请先到麦当劳 App 核对订单状态。")
         _print(receipt)
         sys.exit(2)
     # 到点任务下单成功 → 置 done（与「等用户确认后置 done」的状态说明一致）
@@ -572,7 +604,15 @@ def cmd_order(args):
     if sched and sched.get("id"):
         from src import schedule as sch
         sch.complete(sched["id"])
-    print("下单结果（真实优惠已入账本）:")
+    verification = receipt.get("savingsVerification", {})
+    if verification.get("verified") and verification.get("ledgerRecorded"):
+        print("订单详情已核实；服务端优惠金额已计入「实际省下」。")
+    elif verification.get("verified"):
+        print("订单详情已核实，但本地账本写入失败；本次优惠未计入账单，请勿因此重复下单。")
+    else:
+        print("订单已创建，但优惠金额未能从订单详情核实；报价金额未计入「实际省下」。")
+    if not receipt.get("receiptLogRecorded", True):
+        print("下单回执日志未能写入本地文件。")
     _print(receipt)
 
 
@@ -608,8 +648,64 @@ def cmd_report(args):
         print(f"\n账本事件 {len(agg['events'])} 条（{ledger.LEDGER_FILE}）")
 
 
+def cmd_data(args):
+    """管理本地缓存、配置副本和生成文件。"""
+    if args.action == "status":
+        result = local_data.status()
+        if args.format == "json":
+            _print(result)
+            return
+        labels = {"cache": "缓存与历史", "config": "本地配置", "generated": "生成文件"}
+        for group in result["groups"]:
+            print(f"{labels[group['name']]}: {group['files']} 个文件，{group['bytes']} 字节")
+            print(f"  路径: {group['path']}")
+            if group.get("unmanagedFiles"):
+                print(f"  未登记文件（导出/删除不处理）: {group['unmanagedFiles']} 个，"
+                      f"{group['unmanagedBytes']} 字节")
+            if group["skippedSymlinks"]:
+                print(f"  已跳过符号链接: {group['skippedSymlinks']} 项")
+        print(f"合计: {result['totalFiles']} 个文件，{result['totalBytes']} 字节")
+        return
+
+    if args.action in {"export", "redact"}:
+        redact = args.action == "redact" or args.redact
+        try:
+            result = local_data.export_archive(args.out, redact=redact, overwrite=args.force)
+        except (ValueError, OSError) as e:
+            print(f"[data] 导出失败：{e}", file=sys.stderr)
+            sys.exit(1)
+        if args.format == "json":
+            _print(result)
+        else:
+            mode = "已脱敏副本" if redact else "Token 已剔除的备份"
+            print(f"{mode}已导出：{result['path']}（{result['files']} 个文件，{result['bytes']} 字节）")
+            print("原始本地文件未修改。" if redact else "订单与地址等个人数据仍可能包含在备份中。")
+        return
+
+    if not args.yes or args.confirm_text.strip() != local_data.DELETE_CONFIRM_TEXT:
+        result = local_data.status()
+        print(f"将删除缓存与历史数据（{result['groups'][0]['managedFiles']} 个已登记文件）。")
+        print("其它目录默认保留；加 --include-config / --include-generated 才会删除。")
+        scopes = (" --include-config" if args.include_config else "")
+        scopes += (" --include-generated" if args.include_generated else "")
+        print(f'确认后重跑：python main.py data delete{scopes} --yes --confirm-text "删除本地数据"')
+        sys.exit(4)
+    try:
+        result = local_data.delete(include_config=args.include_config,
+                                   include_generated=args.include_generated)
+    except OSError as e:
+        print(f"[data] 删除未完成：{e}。请运行 data status 检查剩余文件。", file=sys.stderr)
+        sys.exit(1)
+    if args.format == "json":
+        _print(result)
+    else:
+        print(f"已删除 {result['deletedFiles']} 个本地文件。")
+        for group, count in result["byGroup"].items():
+            print(f"  {group}: {count} 个")
+
+
 def cmd_share(args):
-    """I 省钱战报 → share payload（图片，对外转发）。"""
+    """I 下单前优惠方案 → share payload（图片，对外转发）。"""
     draft_path = Path(order_exec.DRAFT_DIR) / args.draft
     if not draft_path.exists():
         draft_path = Path(args.draft)
@@ -799,7 +895,31 @@ def main():
     add_fmt(p, default="html")
     p.set_defaults(fn=cmd_report)
 
-    p = sub.add_parser("share", help="省钱战报 → share 图片")
+    p = sub.add_parser("data", help="查看、导出、脱敏或删除本地数据")
+    dsub = p.add_subparsers(dest="action", required=True)
+    d = dsub.add_parser("status", help="查看本地数据文件数量与占用")
+    d.add_argument("--format", choices=["text", "json"], default="text")
+    d.set_defaults(fn=cmd_data)
+    d = dsub.add_parser("export", help="导出本地数据；始终剔除 Token")
+    d.add_argument("--out", required=True, help="输出 ZIP 文件路径")
+    d.add_argument("--redact", action="store_true", help="同时脱敏结构化个人信息")
+    d.add_argument("--force", action="store_true", help="覆盖已存在的导出文件")
+    d.add_argument("--format", choices=["text", "json"], default="text")
+    d.set_defaults(fn=cmd_data)
+    d = dsub.add_parser("redact", help="导出脱敏副本，不修改原文件")
+    d.add_argument("--out", required=True, help="输出 ZIP 文件路径")
+    d.add_argument("--force", action="store_true", help="覆盖已存在的导出文件")
+    d.add_argument("--format", choices=["text", "json"], default="text")
+    d.set_defaults(fn=cmd_data)
+    d = dsub.add_parser("delete", help="删除本地缓存；其它范围须显式指定")
+    d.add_argument("--yes", action="store_true", help="确认删除")
+    d.add_argument("--confirm-text", default="", help="须精确填写「删除本地数据」")
+    d.add_argument("--include-config", action="store_true", help="同时删除含 Token/个人信息的 config.local.json")
+    d.add_argument("--include-generated", action="store_true", help="同时删除 data/ 下的生成文件")
+    d.add_argument("--format", choices=["text", "json"], default="text")
+    d.set_defaults(fn=cmd_data)
+
+    p = sub.add_parser("share", help="待下单优惠方案 → share 图片")
     p.add_argument("--draft", required=True)
     p.add_argument("--drops", type=int, default=0)
     add_fmt(p, default="svg")

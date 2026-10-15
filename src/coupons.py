@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """C · 自动领券（免费写操作，允许自动执行，留回执）"""
+from __future__ import annotations
+
 import time
 
 # 已领取状态取值（实测 couponStatus 可能是英文枚举，label 可能含「已领取」）

@@ -7,6 +7,8 @@
 - 读写白名单：花钱动作（create-order 等）必须显式传 confirm=True 且经人类确认
 - 响应兼容：直接 JSON 或 SSE（"data:" 行）
 """
+from __future__ import annotations
+
 import json
 import socket
 import time

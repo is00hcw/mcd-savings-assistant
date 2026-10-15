@@ -3,6 +3,8 @@
 
 渲染层（内联卡片 / HTML / 图片）一律不写在这里，由 present.render 分发。
 """
+from __future__ import annotations
+
 from . import present, persona, order_exec, coupons
 
 
@@ -10,13 +12,29 @@ from . import present, persona, order_exec, coupons
 # alert：降价提醒 / 领券回执 / 到点提醒（内联卡片）
 # ---------------------------------------------------------------------------
 def alert_price_drop(events: list[dict], nick: str = "老大",
-                     scanned: int = 0) -> dict:
+                     scanned: int = 0, scan_errors: int = 0) -> dict:
     """盯价巡检的降价/新低 → alert payload。"""
     new_lows = [e for e in events if e.get("type") in ("new_low", "dropped")]
     if not new_lows:
+        if scan_errors and not scanned:
+            return present.make_payload(
+                "alert", "巡检失败",
+                f"{nick}，尝试巡检的门店都没有成功读取菜单，不能判断当前是否有优惠。",
+                metrics=[{"label": "巡检失败", "value": scan_errors, "unit": "家"}],
+                meta={"hint": "检查网络、门店状态后重试。"},
+            )
+        if not scanned:
+            return present.make_payload(
+                "alert", "暂无可巡检门店",
+                f"{nick}，还没有配置可巡检的门店。",
+                meta={"hint": "先配置常去门店，或使用 --stores 指定门店。"},
+            )
+        hint = (f"部分门店巡检失败（{scan_errors} 家），本次结果不完整。"
+                if scan_errors else "")
         return present.make_payload(
             "alert", "暂无新优惠", f"{nick}，这轮巡检没抓到降价，我继续盯着。",
             metrics=[{"label": "巡检门店", "value": scanned, "unit": "家"}],
+            meta={"hint": hint} if hint else None,
         )
     items = []
     metrics = [{"label": "抓到降价", "value": len(new_lows), "unit": "个", "emphasis": True}]
@@ -41,7 +59,11 @@ def alert_price_drop(events: list[dict], nick: str = "老大",
             float(new_lows[0].get("currentPrice") or 0),
             new_lows[0].get("storeCode", "")),
         metrics=metrics, items=items,
-        meta={"hint": "要下单？跑 best 生成草稿，确认后才会真下单。"},
+        meta={"hint": "；".join(filter(None, [
+            "要下单？跑 best 生成草稿，确认后才会真下单。",
+            f"部分门店巡检失败（{scan_errors} 家），本次结果不完整。"
+            if scan_errors else "",
+        ]))},
     )
 
 
@@ -144,7 +166,7 @@ def confirm_from_draft(draft: dict, draft_path: str = "") -> dict:
         {"label": "到手价", "value": draft.get("price"), "unit": "元", "emphasis": True},
     ]
     if saved > 0:
-        metrics.append({"label": "省", "value": saved, "unit": "元", "emphasis": True})
+        metrics.append({"label": "预计优惠", "value": saved, "unit": "元", "emphasis": True})
     # 外卖场景：展示配送费/打包费，让用户看清总价构成
     if draft.get("orderType") == 2 or draft.get("takeWay") == "delivery":
         if draft.get("deliveryFee"):
@@ -183,6 +205,7 @@ def confirm_from_draft(draft: dict, draft_path: str = "") -> dict:
                           f'{order_exec.QUOTE_TTL_SECONDS // 60} 分钟内有效，超时需重新确认')
     if draft.get("pricingWarnings"):
         hint_parts.append("⚠️ 结果可能不完整：" + "；".join(draft["pricingWarnings"]))
+    hint_parts.append("这是下单前报价；优惠金额为预计值，未计入实际省下。")
 
     return present.make_payload(
         "confirm", title, summary,
@@ -197,6 +220,7 @@ def confirm_from_draft(draft: dict, draft_path: str = "") -> dict:
         meta={
             "hint": "｜".join(hint_parts),
             "trace": draft.get("savingDetail", ""),
+            "savingsStatus": "quoted_not_purchased",
         },
     )
 
@@ -250,7 +274,8 @@ def confirm_candidates(track_a: dict, track_b: dict,
         metrics=[{"label": "候选", "value": len(items), "unit": "单"}],
         items=items,
         actions=actions,
-        meta={"hint": "确认哪条就点哪条；未确认前我不会调用 create-order。"},
+        meta={"hint": "候选金额都是下单前预计报价，不计入实际省下；确认哪条就点哪条，未确认前我不会调用 create-order。",
+              "savingsStatus": "quoted_not_purchased"},
     )
 
 
@@ -267,6 +292,9 @@ def report_from_ledger(agg: dict, nick: str = "老大") -> dict:
         {"label": "实际省下", "value": agg.get("saved", 0), "unit": "元", "emphasis": True},
         {"label": "确认订单", "value": agg.get("orders", 0), "unit": "单"},
     ]
+    unverified = int(agg.get("unverifiedOrders") or 0)
+    if unverified:
+        metrics.append({"label": "优惠待核实", "value": unverified, "unit": "单"})
     if potential > 0:
         metrics.append({"label": "潜在优惠(未购买)", "value": potential, "unit": "元"})
     metrics.append({"label": "抓住降价", "value": agg.get("drops", 0), "unit": "次"})
@@ -274,25 +302,26 @@ def report_from_ledger(agg: dict, nick: str = "老大") -> dict:
     return present.make_payload(
         "report", f'麦麦省钱账单（{_PERIOD_CN.get(period, period)}）',
         persona.on_savings_report(agg.get("saved", 0), agg.get("drops", 0),
-                                  _PERIOD_CN.get(period, period), potential=potential),
+                                  _PERIOD_CN.get(period, period), potential=potential,
+                                  unverified=unverified),
         metrics=metrics,
         items=agg.get("items") or [],
-        meta={"hint": "账本只记本机（~/.mcd-skill/ledger.jsonl）。"
-                      "「实际省下」仅含真实下单的优惠；「潜在优惠」是盯价发现的降价估算，"
-                      "尚未购买，二者不相加。"},
+        meta={"hint": "账本只保存在本机数据目录（默认 ~/.mcd-skill，可用 MCD_SKILL_DATA 修改）。"
+                      "「实际省下」仅含 query-order.totalDiscountAmount 已核实的订单优惠；"
+                      "旧报价和待核实订单不计入。潜在优惠是未购买的盯价估算，二者不相加。"},
     )
 
 
 # ---------------------------------------------------------------------------
-# share：省钱战报（图片，对外转发）
+# share：下单前优惠方案与复现配方（图片）
 # ---------------------------------------------------------------------------
-def share_from_draft(draft: dict, drops: int = 0, saved_total: float | None = None) -> dict:
+def share_from_draft(draft: dict, drops: int = 0) -> dict:
     from .share_card import build_recipe
     saved = float(draft.get("discount") or 0)
     coupon = draft.get("coupon")
     metrics = []
     if saved > 0:
-        metrics.append({"label": "本单省", "value": saved, "unit": "元", "emphasis": True})
+        metrics.append({"label": "预计优惠（未下单）", "value": saved, "unit": "元", "emphasis": True})
         metrics.append({"label": "到手价", "value": draft.get("price"), "unit": "元"})
     else:
         metrics.append({"label": "到手价", "value": draft.get("price"), "unit": "元", "emphasis": True})
@@ -302,14 +331,16 @@ def share_from_draft(draft: dict, drops: int = 0, saved_total: float | None = No
     coupon_txt = (f'用券「{coupon.get("name") or coupon.get("couponCode")}」'
                   if coupon else "本单未用券/积分")
     return present.make_payload(
-        "share", "麦麦降价战报",
-        f'{coupon_txt}，原价 {draft.get("originalPrice")} 到手 {draft.get("price")}。',
+        "share", "麦麦优惠方案（待下单）",
+        f'{coupon_txt}，原价 {draft.get("originalPrice")}，报价到手 {draft.get("price")}。'
+        "当前仍是待下单报价，未计入「实际省下」。",
         metrics=metrics,
         items=[{"name": it.get("name") or it.get("productCode"),
                 "quantity": it.get("quantity")} for it in draft.get("items", [])],
         recipe=build_recipe(draft),
         draft=draft,
-        meta={"hint": "配方不含任何凭据；好友复现下单时同样需要他本人确认。"},
+        meta={"hint": "这是未下单报价；配方不含凭据，好友复现下单时同样需要他本人确认。",
+              "savingsStatus": "quoted_not_purchased"},
     )
 
 

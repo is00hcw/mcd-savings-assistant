@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -24,8 +25,8 @@ WORKBUDDY_DOC = "https://www.workbuddy.cn/docs/workbuddy/Overview"
 FIRST_RUN_STEPS = [
     ("① 领 Token", f"手机号登录 {TOKEN_URL} → 右上角【控制台】→ 点【激活】→ 复制 MCP Token",
      "免费，约 1 分钟。没 Token 后面所有功能都用不了"),
-    ("② 填配置", "复制 config.example.json 为 config.local.json，把 Token 粘进 mcp_token",
-     "config.local.json 已被 .gitignore 排除，不会泄露到仓库"),
+    ("② 配置 Token", "设置 MCD_MCP_TOKEN，或复制 config.example.json 为 config.local.json 并填写 mcp_token",
+     "本地配置已被 .gitignore 排除；环境变量也可直接使用"),
     ("③ 跑热身", "python main.py warmup && python main.py patrol",
      "warmup 导入历史订单建低价档案，patrol 开始盯价"),
 ]
@@ -55,7 +56,7 @@ def welcome() -> str:
         "  warmup    首启热身（导入订单建低价档案）",
         "  patrol    盯价巡检（降价 / 可领券 / 临期积分）",
         "  best      算最低到手价并生成确认卡（不自动下单）",
-        "  report    省钱账单（HTML 页面）   share  省钱战报（图片）",
+        "  report    省钱账单（HTML 页面）   share  下单前优惠方案（图片）",
         "  coupons   可领券预览（默认只读，不动账户）",
         "",
         "⛔ 下单/积分兑换/抽奖 属花钱动作，必须你本人确认才会执行。",
@@ -79,18 +80,24 @@ def doctor(check_token: bool = True) -> dict:
     add("第三方依赖", True, "零依赖，仅标准库")
 
     # ② 配置文件
+    env_token = os.environ.get("MCD_MCP_TOKEN", "")
+    env_token_ok = bool(env_token) and env_token != "YOUR_MCP_TOKEN"
     if not _config.LOCAL_CONFIG.exists():
-        add("config.local.json", False, "文件不存在",
-            "复制模板：cp config.example.json config.local.json")
-        return {"checks": checks, "ready": False,
-                "text": _render(checks, next_steps=["先完成上面第 ② 步：复制配置模板并填入 Token"])}
-    add("config.local.json", True, str(_config.LOCAL_CONFIG))
+        if not env_token_ok:
+            add("config.local.json", False, "文件不存在，且未设置 MCD_MCP_TOKEN",
+                "设置环境变量 MCD_MCP_TOKEN，或复制配置模板并填写 Token")
+            return {"checks": checks, "ready": False,
+                    "text": _render(checks, next_steps=["设置 Token 后重跑 doctor"])}
+        add("config.local.json", None, "文件不存在（可选），使用环境变量 MCD_MCP_TOKEN")
+    else:
+        add("config.local.json", True, str(_config.LOCAL_CONFIG))
 
     # ③ Token
     try:
         cfg = get_config()
         token_ok = bool(cfg.token) and cfg.token != "YOUR_MCP_TOKEN"
-        add("MCP Token", token_ok, "已配置（仅本地保存）" if token_ok else "未配置",
+        source = "环境变量" if env_token_ok else "本地配置"
+        add("MCP Token", token_ok, f"已配置（{source}）" if token_ok else "未配置",
             f"去 {TOKEN_URL} 手机号登录 → 控制台 → 激活 → 复制 Token" if not token_ok else "")
     except SystemExit:
         add("MCP Token", False, "未配置或仍是占位符",
@@ -130,7 +137,7 @@ def doctor(check_token: bool = True) -> dict:
             "  1) python main.py warmup    # 导入历史订单，建低价档案与常买 Top3",
             "  2) python main.py patrol    # 巡检常去门店，抓降价 / 可领券 / 临期积分",
             "  3) python main.py best --store <门店code> --items \"经典麦旋风 x1\"   # 算最低到手价（不会下单）",
-            "  4) python main.py report    # 看省钱账单   python main.py share --draft <草稿>  # 战报图",
+            "  4) python main.py report    # 看省钱账单   python main.py share --draft <草稿>  # 优惠方案图",
         ]
     else:
         steps = [f"· {c['fix']}" for c in checks if c["ok"] is False and c["fix"]] or [
@@ -176,12 +183,14 @@ def capabilities() -> dict:
              "cli": "delivery"},
             {"code": "G", "name": "定时与确认", "desc": "草稿确认闸三层拦截，未经用户确认绝不执行花钱动作",
              "cli": "order"},
-            {"code": "H", "name": "省钱账单", "desc": "账本聚合 drop 估算 + order 真实优惠，产出可存档 HTML",
+            {"code": "H", "name": "省钱账单", "desc": "仅汇总 query-order.totalDiscountAmount 已核实的订单优惠；盯价估算和待核实订单单独展示",
              "cli": "report"},
-            {"code": "I", "name": "省钱战报", "desc": "分享用图片 + 不含凭据的 order recipe（二维码复现）",
+            {"code": "I", "name": "优惠方案分享", "desc": "下单前预计优惠图片 + 不含凭据的 order recipe（二维码复现）",
              "cli": "share"},
             {"code": "—", "name": "地址自动推导", "desc": "从麦乐送已存地址推导常用地址，订单门店地址兜底",
              "cli": "address / warmup --apply-address"},
+            {"code": "J", "name": "本地数据管理", "desc": "查看数据占用、剔除 Token 导出、生成脱敏副本或经确认删除缓存",
+             "cli": "data status / export / redact / delete"},
         ],
         "outputContract": {
             "types": ["alert", "confirm", "report", "share"],
@@ -191,16 +200,17 @@ def capabilities() -> dict:
         "hardRules": [
             "create-order / mall-create-order / cancel-order / draw-lottery 必须用户本人明确确认",
             "领券（auto-bind-coupons）需显式 --claim --yes",
-            "MCP Token 与个人信息只存 config.local.json（已 gitignore），不写入任何输出与仓库",
+            "MCP Token 与个人信息仅从环境变量或本地配置读取，不写入任何输出与仓库",
             "限流 600 次/分钟，客户端内置滑动窗口控频",
             "分享图只给配方不给执行权限",
+            "导出永远剔除 Token；脱敏只处理副本；删除缓存须精确确认",
         ],
         "onboarding": {
             "firstScreen": "python main.py（打印欢迎页与三步引导）",
             "selfCheck": "python main.py doctor",
             "steps": [{"title": t, "how": h, "why": w} for t, h, w in FIRST_RUN_STEPS],
         },
-        "voice": "称呼用户「老大」；先报结果再报省了多少；到点有画面感；确认话术固定",
+        "voice": "称呼用户「老大」；先报到手价，再区分预计优惠与实际省下；到点有画面感；确认话术固定",
     }
 
 

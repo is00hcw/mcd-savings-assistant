@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """人设话术层：「老大」人格
 
-三原则：① 干脆有汇报感 ② 省了多少讲成数字 ③ 到点有画面感。
+三原则：① 干脆有汇报感 ② 把预计优惠和已核实优惠分开报数 ③ 到点有画面感。
 确认闸话术不弱化红线。
 """
 from .config import get_config
@@ -25,7 +25,7 @@ def on_price_drop(name: str, prev: float, cur: float, store_code: str = "") -> s
 
 
 def on_coupon_usable(name: str, saving: float) -> str:
-    return (f"{nick()}，你常点的 {name}，今天有张券能再省 {saving:g} 块，"
+    return (f"{nick()}，你常点的 {name}，今天有张券预计优惠 {saving:g} 元，"
             f"到手价我给你算好了。")
 
 
@@ -38,12 +38,14 @@ def on_meal_time() -> str:
 
 
 def on_savings_report(saved: float, drops: int, period: str = "这周",
-                      potential: float = 0.0) -> str:
+                      potential: float = 0.0, unverified: int = 0) -> str:
+    parts = [f"{period}订单详情已核实优惠 {saved:g} 元"]
     if potential > 0:
-        return (f"{nick()}，{period}实际省下 {saved:g}，另发现 {potential:g} 的潜在优惠"
-                f"（还没买，不算数），抓了 {drops} 次降价。")
-    return (f"{nick()}，{period}帮你省了 {saved:g}，抓了 {drops} 次降价，"
-            f"战绩能发朋友圈了。")
+        parts.append(f"另有 {potential:g} 元潜在优惠（未购买，不计入实际省下）")
+    if unverified > 0:
+        parts.append(f"{unverified} 单优惠待订单详情核实")
+    parts.append(f"发现降价 {drops} 次")
+    return f"{nick()}，" + "；".join(parts) + "。"
 
 
 def confirm_gate(draft: dict) -> str:
@@ -60,7 +62,7 @@ def confirm_gate(draft: dict) -> str:
     else:
         body = f"原价 {orig:g}，到手 {price:g}"
     if discount > 0:
-        body += f"，省 {discount:g}"
+        body += f"，预计优惠 {discount:g} 元（下单前报价）"
     return f"{nick()}，这单我算好了：{body}。你确认我就下，不确认我不动。"
 
 
@@ -80,7 +82,7 @@ def confirm_gate_scheduled(draft: dict) -> str:
         coupon_txt = "这单没券可用"
     parts = [f"原价 {orig:g}", f"到手 {price:g}"]
     if discount > 0:
-        parts.append(f"省 {discount:g}")
+        parts.append(f"预计优惠 {discount:g} 元")
     return (f"{nick()}，{at} 的单我按此刻的价格重新算好了："
             + "，".join(parts) + f"，{coupon_txt}。你确认我就下，不确认我不动。")
 

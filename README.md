@@ -7,7 +7,7 @@
 
 **项目介绍**：麦当劳 MCP 把「菜单优惠价 / 卡包券 / 订单历史 / 积分」这些原本只能手动翻的
 数据摊开了。这个 Skill 把它们串成一条闭环——**感知（盯价巡检）→ 决策（带券枚举算最低到手价）
-→ 执行（生成下单卡）→ 复盘（省钱账单与战报）**，让「今天哪顿最划算」变成被动收到的提醒，
+→ 执行（生成下单卡）→ 复盘（已核实账单与优惠方案分享）**，让「今天哪顿最划算」变成被动收到的提醒，
 而不是你每天自己去比价。产品定位是副驾而非自动扣款工具：所有花钱动作都必须经过用户本人确认。
 
 ## 目标用户
@@ -28,7 +28,7 @@
 | 领券：显式 `--claim --yes` 才写账户，免费动作留回执 | 取消订单 / 抽奖 |
 | 算价：带券枚举，线性挑出最低到手价（积分券每单限 1 张、不叠加） | |
 | 临期积分提醒 + 常买商品 Top3 统计 | |
-| 省钱账单与战报：实际省下 X 元（真实下单）+ 潜在优惠 Y 元（盯价估算，分开展示）+ 抓 Z 次降价，可截图分享（配方不含任何凭据） | |
+| 省钱账单：仅将订单详情核实的优惠列为实际省下，盯价估算单列为潜在优惠；分享草稿只展示预计优惠，不冒充实际省钱 | |
 
 ## 输出形态（三层，同数据源多渲染）
 
@@ -39,7 +39,9 @@
 | `alert` | 降价提醒 / 领券回执 / 到点提醒 / 积分临期 | 内联卡片（对话流内直接看） | `patrol` / `coupons` |
 | `confirm` | 下单确认闸 / 双轨候选二选一 | 交互卡片（确认/取消按钮） | `best` |
 | `report` | 省钱账单（细看/存档） | HTML 页面 | `report` |
-| `share` | 省钱战报（对外转发） | 图片 SVG | `share` |
+| `share` | 下单前优惠方案与复现配方 | 图片 SVG | `share` |
+
+`share` 当前从待下单草稿生成，卡片会标明「预计优惠」，不会计入已核实账单。
 
 **产出 payload 的命令**支持 `--format inline|json|html|svg`（`patrol` / `best` / `coupons` /
 `report` / `share` / `doctor` / `capabilities` / `render`），例如：
@@ -195,7 +197,7 @@ python main.py schedule watch           # 常驻轮询（本地调试用，生�
 | 「取消所有未支付订单」 | cancel_unpaid | `python main.py cancel`（预览）→ `python main.py cancel --yes --confirm-text "确认取消"` | ⚠️ 取消不可逆；仅覆盖近期可见订单，更早的未支付单需到 App 处理 |
 | **复盘与分享** | | | |
 | 「我一共省了多少钱」 | report | `python main.py report --period month` | 默认按月，可换 today/week/all |
-| 「发个战报 / 生成战报图」 | share | `python main.py share --draft <草稿.json>` | 图片用于对外转发，配方不含任何凭据 |
+| 「分享这单优惠方案 / 生成优惠方案图」 | share | `python main.py share --draft <草稿.json>` | 图片展示待下单报价，配方不含任何凭据 |
 | **配置与地址** | | | |
 | 「帮我填好地址 / 我的地址在哪」 | address | `python main.py address --apply` | 需确认：从麦乐送已存地址推导；写入前先给用户看推导结果 |
 
@@ -235,7 +237,7 @@ python main.py patrol        # 巡检常去门店：降价 / 可领券 / 临期�
 | 看这门技能有没有坑 | `python main.py doctor` |
 | 自动填常用地址 | `python main.py address --apply` |
 | 看我一共省了多少 | `python main.py report --period month` |
-| 生成能发朋友圈的战报 | `python main.py share --draft <草稿.json>` |
+| 分享待下单优惠方案 | `python main.py share --draft <草稿.json>` |
 
 > 直接在 WorkBuddy 里对话使用也可以，`skill.md` 已写好全部指令（见下方「WorkBuddy Agent Skill」）。
 
@@ -273,7 +275,12 @@ python main.py cancel                         # 预览「近期可见」的未�
 python main.py cancel --yes --confirm-text "确认取消"
                                              # ⚠️ 红线：逐单取消未支付订单，须本人确认
 python main.py report --period month          # 省钱账单 → HTML 页面
-python main.py share --draft <draft.json>     # 省钱战报 → 图片 + 好友复现提示词
+python main.py share --draft <draft.json>     # 待下单优惠方案 → 图片 + 好友复现提示词
+python main.py data status                    # 查看本机缓存、配置和生成文件的概况
+python main.py data export --out backup.zip   # 导出备份；Token 字段始终剔除
+python main.py data redact --out public.zip   # 另存脱敏副本，不改原文件
+python main.py data delete --yes --confirm-text "删除本地数据"
+                                             # 删除登记过的缓存；配置/生成文件需单独加选项
 python main.py raw --tool query-my-account   # 调试：直接调任意只读工具
 ```
 
@@ -297,7 +304,18 @@ Top3 里挑最优）单轨直出；`--track dual` 双轨候选二选一——两
 | `user.delivery_address` | 外卖配送地址（可选） |
 | `agent.*` | 巡检门店数上限 / 新低阈值 / 临期积分阈值 |
 
-本地数据（低价基线、菜单快照、商品档案、省钱账本）只存在 `~/.mcd-skill/`，**不收集、不上传**。
+本地数据（低价基线、菜单快照、商品档案、省钱账本、订单回执和定时任务）默认存在 `~/.mcd-skill/`，
+可用 `MCD_SKILL_DATA` 改目录。`data status` 只显示文件数量与大小；导出时始终剔除 Token。
+普通备份仍可能包含地址、门店和订单信息；`data redact` 会把结构化个人字段替换为占位值，
+省略商品档案、门店名称和已处理订单编号，菜单快照使用不含门店码的归一化文件名，
+并排除 `data/` 下的生成文件。ZIP 的 `manifest.json` 会列出排除组、排除文件和匿名化目录。
+脱敏导出遇到不支持的二进制文件会停止并保留原文件。
+`data delete` 默认只清理登记过的缓存文件；项目根的 `config.local.json` 和 `data/` 生成文件
+需分别显式加 `--include-config` / `--include-generated`，并输入精确确认语句。未登记的缓存目录文件会保留。
+`data status` 会单独列出未登记文件；这些文件不会被本工具导出或删除。
+
+账单口径：只有通过 `query-order.totalDiscountAmount` 核实的订单优惠计入「实际省下」；
+下单前报价与盯价发现的降价分列为预计/潜在优惠。历史旧账本记录无法确认数据来源，会列为「优惠待核实」，不回填到实际金额。
 
 ## 个人信息不用手填：自动推导
 
@@ -329,6 +347,6 @@ python main.py warmup --apply-address --apply-stores   # 首启一并回填地�
 
 - 本项目为参赛作品，非麦当劳官方产品；仅供个人学习与非商业用途，
   使用即表示同意遵守麦当劳《使用条款》与《MCP 服务规则》。
-- Token 仅保存在你本机 `config.local.json`，本工具不收集不上传任何个人数据。
+- Token 可从本机环境变量或 `config.local.json` 读取，本工具不收集不上传任何个人数据。
 - 价格记忆 = 本地观测到的「最低活动价」，非官方保证价；购买历史归纳为启发式建议。
 - 限流：官方 600 次/分钟/token，客户端已内置滑动窗口自动控频。

@@ -11,8 +11,11 @@ CLI 的 order 命令必须带 --confirm 且用户在对话中明确同意过草�
   ③ 草稿报价超过 TTL 即失效、用券已过期即拒绝；
   ④ confirm-text 必须精确匹配一次性确认凭证（非任意非空字符串）。
 """
+from __future__ import annotations
+
 import hashlib
 import json
+import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -47,10 +50,8 @@ def draft_digest(draft: dict) -> str:
     """草稿内容摘要（sha256 前 16 位）：覆盖 execute_draft 实际发给 create-order
     的全部字段。
 
-    用于确认前校验「用户看过的那份草稿文件」是否被篡改。摘要必须覆盖**下单请求
-    用到的每一个字段**——beType / reservationDate / couponId / couponCode 都是
-    execute_draft 原样透传给 create-order 的，只摘要其中一部分就等于留了篡改
-    漏洞（改没被摘要的那一项，digest 不变却能改下单结果）。
+    用于确认前校验「用户看过的那份草稿文件」是否被篡改。摘要覆盖下单请求字段，
+    也覆盖 quotedAt，防止通过改写报价时间延长草稿有效期。
     """
     coupon = draft.get("coupon") or {}
     core = {
@@ -61,6 +62,7 @@ def draft_digest(draft: dict) -> str:
         "beCode": draft.get("beCode"),
         "addressId": draft.get("addressId"),
         "reservationDate": draft.get("reservationDate"),
+        "quotedAt": draft.get("quotedAt"),
         "items": _items_fingerprint(draft.get("items")),
         "couponId": coupon.get("couponId"),
         "couponCode": coupon.get("couponCode"),
@@ -115,15 +117,18 @@ def validate_for_order(draft: dict, now: datetime | None = None) -> tuple[bool, 
         return False, "草稿内容与生成时不一致（可能被改动），请重新执行 best 算价"
 
     quoted = draft.get("quotedAt")
-    if quoted:
-        try:
-            qt = datetime.strptime(str(quoted)[:19], "%Y-%m-%d %H:%M:%S")
-            age = (now - qt).total_seconds()
-            if age > QUOTE_TTL_SECONDS:
-                return False, ("草稿报价已过期（" + str(QUOTE_TTL_SECONDS // 60)
-                               + " 分钟前算的价），请重新执行 best 算价")
-        except ValueError:
-            pass
+    if not quoted:
+        return False, "草稿缺少报价时间（quotedAt），请重新执行 best 算价"
+    try:
+        qt = datetime.strptime(str(quoted), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False, "草稿报价时间无效（quotedAt），请重新执行 best 算价"
+    age = (now - qt).total_seconds()
+    if age < 0:
+        return False, "草稿报价时间晚于当前时间，请重新执行 best 算价"
+    if age > QUOTE_TTL_SECONDS:
+        return False, ("草稿报价已过期（" + str(QUOTE_TTL_SECONDS // 60)
+                       + " 分钟前算的价），请重新执行 best 算价")
 
     coupon = draft.get("coupon") or {}
     exp = coupon.get("expireAt")
@@ -181,6 +186,22 @@ def diff_draft(old: dict, new: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 # 执行
 # ---------------------------------------------------------------------------
+def _order_rows(raw) -> list[dict]:
+    """提取订单列表，兼容 MCP 返回的常见数组字段和 data 包装。"""
+    value = raw
+    for _ in range(3):
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if not isinstance(value, dict):
+            return []
+        for key in ("list", "orders", "orderList", "records"):
+            rows = value.get(key)
+            if isinstance(rows, list):
+                return [item for item in rows if isinstance(item, dict)]
+        value = value.get("data")
+    return []
+
+
 def _order_id_snapshot(client) -> set[str] | None:
     """下单前记录现有订单 id 快照，用于「结果不确定」时判断是否已创建新单。
 
@@ -190,9 +211,15 @@ def _order_id_snapshot(client) -> set[str] | None:
         raw = client.order_list()
     except Exception:
         return None
-    d = raw.get("data") if isinstance(raw, dict) else raw
-    items = d.get("list") if isinstance(d, dict) else (d if isinstance(d, list) else [])
-    return {str(o.get("orderId")) for o in items if o.get("orderId")}
+    return {str(o.get("orderId")) for o in _order_rows(raw) if o.get("orderId")}
+
+
+def _log_receipt_best_effort(receipt: dict) -> None:
+    receipt["receiptLogRecorded"] = True
+    try:
+        _log_receipt(receipt)
+    except OSError:
+        receipt["receiptLogRecorded"] = False
 
 
 def _uncertain_receipt(client, draft: dict, err: Exception,
@@ -208,8 +235,7 @@ def _uncertain_receipt(client, draft: dict, err: Exception,
     if before_ids is not None:
         try:
             raw = client.order_list()
-            d = raw.get("data") if isinstance(raw, dict) else raw
-            items = d.get("list") if isinstance(d, dict) else (d if isinstance(d, list) else [])
+            items = _order_rows(raw)
             new_unpaid = [o for o in items
                           if str(o.get("orderId")) not in before_ids
                           and is_unpaid_status(o.get("orderStatus"))]
@@ -235,8 +261,48 @@ def _uncertain_receipt(client, draft: dict, err: Exception,
             "若已生成则无需再操作；若没有，再重新执行下单。"
         ),
     }
-    _log_receipt(receipt)
+    _log_receipt_best_effort(receipt)
     return receipt
+
+
+def _find_order_id(value) -> str:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).replace("_", "").lower() in {"orderid", "orderno"}:
+                if isinstance(child, (str, int)) and str(child).strip():
+                    return str(child).strip()
+        for child in value.values():
+            found = _find_order_id(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_order_id(child)
+            if found:
+                return found
+    return ""
+
+
+def _find_order_discount(value) -> float | None:
+    if isinstance(value, dict):
+        if "totalDiscountAmount" in value:
+            try:
+                amount = float(value["totalDiscountAmount"])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if math.isfinite(amount) and amount >= 0:
+                return round(amount, 2)
+            return None
+        for child in value.values():
+            amount = _find_order_discount(child)
+            if amount is not None:
+                return amount
+    elif isinstance(value, list):
+        for child in value:
+            amount = _find_order_discount(child)
+            if amount is not None:
+                return amount
+    return None
 
 
 def execute_draft(client, draft: dict) -> dict:
@@ -282,20 +348,37 @@ def execute_draft(client, draft: dict) -> dict:
         "price": draft.get("price"),
         "result": result,
     }
-    _log_receipt(receipt)
-    # 真实优惠入账本（精确值：原价-实付）
+    order_id = _find_order_id(result)
+    actual_discount = None
+    if order_id:
+        try:
+            actual_discount = _find_order_discount(client.query_order(order_id))
+        except Exception:
+            actual_discount = None
+    receipt["savingsVerification"] = {
+        "verified": actual_discount is not None,
+        "source": "query-order.totalDiscountAmount" if actual_discount is not None else None,
+        "amount": actual_discount,
+        "ledgerRecorded": False,
+    }
+    # A quoted draft discount is not an actual saving; only the order detail can verify it.
     try:
         from . import ledger
         ledger.append_event(
             "order", storeCode=draft.get("storeCode"),
             name=",".join(str(it.get("name") or it.get("productCode"))
                           for it in draft.get("items", [])),
+            orderId=order_id or None,
             originalPrice=draft.get("originalPrice"), price=draft.get("price"),
-            saved=round(float(draft.get("discount") or 0), 2),
+            savingsVerified=actual_discount is not None,
+            savingsSource="query-order.totalDiscountAmount" if actual_discount is not None else None,
+            saved=actual_discount,
             takeWay=draft.get("takeWay") or draft.get("takeWayCode"),
         )
+        receipt["savingsVerification"]["ledgerRecorded"] = True
     except Exception:
-        pass  # 账本失败不影响下单结果
+        pass  # 账本失败不影响已成功的下单结果
+    _log_receipt_best_effort(receipt)
     return receipt
 
 

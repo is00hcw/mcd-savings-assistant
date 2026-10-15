@@ -12,6 +12,8 @@ CLI 层再叠加 --yes + --confirm-text「确认取消」双重确认。
 ⚠️ 扫描范围：order-list 无分页参数、只返回近期订单（约最近 10 笔），
 本命令只能覆盖「近期可见」范围的未支付单，更早的未支付单不在清理范围内。
 """
+from __future__ import annotations
+
 from .mcd_client import McdClient
 
 CONFIRM_TEXT = "确认取消"          # 一次性确认凭据：必须精确匹配

@@ -4,6 +4,8 @@
 常去门店 query-meals → 按归一化 name 跨店比价 → 检出新低/降价/新特价；
 顺带检测：可领券、券生效、临期积分。
 """
+from __future__ import annotations
+
 from .config import get_config
 from .normalize import meal_index_from_query_meals
 from . import price_memory, ledger

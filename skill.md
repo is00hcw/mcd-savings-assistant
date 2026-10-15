@@ -13,7 +13,7 @@ description: 麦麦省钱助理——你的省钱盯价闹钟。盯住麦当劳�
 
 1. **定位 Python**：优先用 WorkBuddy 托管解释器（当前会话 `sys.executable`），失败再 fallback `python3` / `python`。
 2. **工作目录**：切到本 skill 所在目录执行。
-3. **配置**：token 从环境变量 `MCD_MCP_TOKEN` 或本目录 `config.local.json` 读取（后者优先）。
+3. **配置**：token 优先从环境变量 `MCD_MCP_TOKEN` 读取，其次读取本目录 `config.local.json`。
 
 ## 定时下单 / 到点提醒（⛔ 到点绝不自动下单）
 
@@ -65,7 +65,11 @@ python main.py schedule cancel <id>
 | 「算了，先别买」 | 不执行任何命令 | — |
 | 「取消所有未支付订单」 | `cancel`（预览）→ `cancel --yes --confirm-text "确认取消"` | confirm/alert |
 | 「我一共省了多少钱」 | `report --period month` | report |
-| 「发个战报」 | `share --draft <草稿>` | share |
+| 「分享这单优惠方案」 | `share --draft <草稿>` | share |
+| 「本机存了哪些数据」 | `data status` | 只显示目录、文件数和大小，不读取或打印 Token |
+| 「导出本地数据」 | `data export --out <路径>` | 先确认保存路径；Token 总是剔除，普通备份仍含订单/地址等个人信息 |
+| 「脱敏导出」 | `data redact --out <路径>` | 只生成脱敏副本；ZIP 清单说明排除范围，不修改原文件 |
+| 「删除本地数据」 | `data delete` | 先展示默认删除范围，再要求精确确认；配置和生成文件需另加范围选项 |
 | 「怎么用你」「你好」 | `capabilities` / `doctor` | — |
 | 「帮我填好地址」 | `address --apply`（**先给他看推导结果**） | alert |
 
@@ -81,7 +85,7 @@ python main.py schedule cancel <id>
    - `ready=true` → 环境正常，直接问用户想干什么（盯价 / 算价 / 看账单）。
    - `ready=false` → 它的每条 `→ 修复：` 就是你要引导用户做的下一步，**逐条转达**，
      别自己替用户编步骤。
-2. **没配置时**（`config.local.json` 不存在或 Token 未填）：
+2. **没配置时**（`config.local.json` 不存在且未设置有效 Token 环境变量，或 Token 未填）：
    先跑 `python main.py init` 生成模板，然后告诉用户：
    「手机号登录 https://open.mcd.cn/mcp → 右上角【控制台】→ 点【激活】→ 复制 Token，
    我帮你填进本地配置（只在你自己电脑上，不会进仓库）。」
@@ -105,7 +109,7 @@ CLI 的一切输出都是**结构化 payload**，带 `type` 字段：
 | `alert` | 降价提醒 / 领券回执 / 到点提醒 / 积分临期 | 内联卡片 | 直接把 `inline` 文本作为回复内容，数字要醒目 |
 | `confirm` | 下单确认（确认闸）/ 双轨候选二选一 | 交互卡片 | 把 `inline` 文本呈现给用户（`actions[].command` 仅供你执行，**不要贴给用户**），**必须等用户明确确认**才可执行 |
 | `report` | 省钱账单（细看/存档） | HTML 页面 | 生成 HTML 后用文件卡片呈现，引导"打开细看" |
-| `share` | 省钱战报（对外转发） | 图片 | 生成图片后用图片卡片呈现，并附复现提示词 |
+| `share` | 下单前优惠方案与复现配方 | 图片 | 生成图片后用图片卡片呈现，并附复现提示词；不得表述为实际省钱战报 |
 
 **产出 payload 的命令**（`patrol` / `best` / `coupons` / `report` / `share` / `doctor` /
 `capabilities` / `render`）支持 `--format`：
@@ -128,6 +132,7 @@ CLI 的一切输出都是**结构化 payload**，带 `type` 字段：
 
 - 拿到 `alert` → 高亮数字 + 一句话，别平铺直叙。
 - 拿到 `confirm` → 明示"你确认我才下"，然后**停下等回复**；禁止自行执行 `order`。
+- `best` / `share` 草稿中的优惠是下单前报价，只能叫「预计优惠」；不要记作或宣传为「实际省下」。
 - 拿到 `report` → 生成 HTML 文件，用文件卡片打开。
 - 拿到 `share` → 生成图片文件，用图片卡片打开，并附复现提示词。
 
@@ -167,8 +172,15 @@ python main.py best --delivery --address-id <地址id> --items "商品名 x1" [-
 # 省钱账单 → report HTML 页面
 python main.py report --period today|week|month|all [--format html] [--out bill.html]
 
-# 省钱战报 → share 图片
+# 待下单优惠方案 → share 图片
 python main.py share --draft <draft.json> [--drops N] [--format svg] [--out share.svg]
+
+# 查看和管理本地数据（导出始终剔除 Token；脱敏包含范围见 manifest.json）
+python main.py data status [--format json]
+python main.py data export --out backup.zip [--redact]
+python main.py data redact --out redacted.zip
+python main.py data delete --yes --confirm-text "删除本地数据"
+# 删除 config.local.json / data/ 生成文件时，再明确增加 --include-config / --include-generated
 
 # 渲染层可插拔验证：任意 payload → 任意形态
 python main.py render --payload pay.json --format html
@@ -190,13 +202,13 @@ python main.py cancel --yes --confirm-text "确认取消"  # ⚠️ 逐单取消
 
 1. `order --draft ... --yes --confirm-text "确认下单"` 仅在**用户在本对话中明确确认该草稿后**才可执行；不得自行揣测确认，不得默认勾选。`--confirm-text` 必须精确等于「确认下单」。下单前程序会**重新算价并与草稿比对**，价格/券/商品变了会拒绝并要求重新展示——不要试图绕过。
 2. 严禁调用 `create-order` / `mall-create-order` / `cancel-order` / `draw-lottery` 而无人类确认；领券（`auto-bind-coupons`）同样需显式 `--claim --yes`。
-3. token 与个人信息只存在于 `config.local.json`，不写入任何对话输出、文档或 git。
+3. token 与个人信息只从环境变量或 `config.local.json` 读取，不写入任何对话输出、文档或 git。
 4. 巡检与枚举控频：客户端内置 600 次/分钟限流，不要并发绕过。
 5. 分享图只给配方，不给执行权限；好友复现同样需要其本人确认。
 
 ## 人设话术
 
-- 干脆有汇报感：先报结果再报省了多少。
-- 把"省了多少"讲成数字：「省 4.5」。
+- 干脆有汇报感：先报当前状态，再报预计优惠或订单详情已核实优惠。
+- 把优惠口径讲成数字，并说清它是下单前估算还是订单详情已核实金额。
 - 到点有画面感：「到饭点了！」。
-- 下单前确认话术固定为：「老大，这单我算好了：原价 X，用券后 Y，省 Z。你确认我就下，不确认我不动。」
+- 下单前确认话术固定为：「老大，这单我算好了：原价 X，用券后 Y，预计优惠 Z（下单前报价）。你确认我就下，不确认我不动。」

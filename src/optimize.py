@@ -18,6 +18,8 @@ takeWayCode 只能来自 calculate-price 的 takeWayList（到店 orderType=1 �
 reservationDate：本工具产出的都是**即时单**（定时任务=到点重算价+提醒+人工确认，
 不做预约单），故恒为 None；字段保留以兼容 create-order 的预约能力与确认闸摘要。
 """
+from __future__ import annotations
+
 import json
 import time
 
@@ -32,7 +34,7 @@ def build_items(client, store_code: str, wanted: list[tuple[str, int]],
     """把 [(商品名或code, 数量)] 解析为 calculate-price 的 items。
 
     商品名会先在该店菜单内按归一化 name 查 code（code 是门店内下单凭证）。
-    同时把商品名回填进 items（供确认卡/战报卡展示，calculate-price 忽略多余字段）。
+    同时把商品名回填进 items（供确认卡/分享卡展示，calculate-price 忽略多余字段）。
     be_type/order_type/be_code：外卖(2/2)场景查菜单必传，否则 query-meals 报错。
     """
     menu = _menu_index(client, store_code, be_type=be_type, order_type=order_type,
@@ -525,7 +527,9 @@ def resolve_delivery(client, address_id: str, store_code: str | None = None,
                               for s in stores[:6])
             raise ValueError(f"门店 {store_code} 不配送该地址；可配送门店：{names}")
         listed = str(hit.get("beCode") or "")
-        if listed and listed != str(be_code):
+        if not listed:
+            raise ValueError(f"门店 {store_code} 查询结果缺少 beCode，无法验证配送业务编码")
+        if listed != str(be_code):
             raise ValueError(f"门店 {store_code} 在该地址的业务编码为 {listed}，"
                              f"与传入 beCode={be_code} 不一致，请重新用 delivery 查询")
         if not _store_open(hit):

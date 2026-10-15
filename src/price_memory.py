@@ -6,6 +6,8 @@
 冷启动：order-list → query-order 用 totalDiscountAmount 判定"买过优惠"作佐证
 （优惠为订单级，单品实付不可得，故只记佐证不记价格）。
 """
+from __future__ import annotations
+
 import json
 import time
 from pathlib import Path

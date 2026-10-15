@@ -148,7 +148,13 @@ def test_recipe_and_gate(tmp):
     assert "token" not in rj.lower() and r["s"] == "1421252"
     assert len(rj.encode("utf-8")) <= 106, f"配方 {len(rj)}B 超二维码上限"
     html = render_card(draft, drops=2)
-    assert "麦麦降价战报" in html and "<svg" in html
+    assert "麦麦优惠方案" in html and "预计优惠" in html and "<svg" in html
+    assert "实际省下" in html and "尚未下单" in html
+    injected = dict(draft, storeName='<script>alert("x")</script>',
+                    items=[{"productCode": "P1", "name": "<img src=x onerror=alert(1)>", "quantity": 1}])
+    safe_html = render_card(injected)
+    assert "<script>alert" not in safe_html and "&lt;script&gt;" in safe_html
+    assert "<img src=x" not in safe_html and "&lt;img" in safe_html
 
     # 确认闸
     order_exec.DRAFT_DIR = tmp
@@ -173,11 +179,12 @@ def test_present_layers():
     assert p["type"] == "share" and p["preferredRender"] == "image"
     assert "token" not in json.dumps(p, ensure_ascii=False).lower()
     inline = present.render(p, "inline")["content"]
-    assert "麦麦降价战报" in inline and "[确认下单]" not in inline  # 图片/卡片不承载交互
+    assert "麦麦优惠方案（待下单）" in inline and "[确认下单]" not in inline  # 图片/卡片不承载交互
+    assert any(m["label"] == "预计优惠（未下单）" for m in p["metrics"])
     html = present.render(p, "html")["content"]
-    assert html.startswith("<!DOCTYPE html>") and "麦麦降价战报" in html
+    assert html.startswith("<!DOCTYPE html>") and "麦麦优惠方案（待下单）" in html
     svg = present.render(p, "svg")["content"]
-    assert svg.startswith("<svg") and "qr" not in svg.lower() or True
+    assert svg.startswith("<svg")
     assert "<path" in svg  # 含二维码路径
     js = json.loads(present.render(p, "json")["content"])
     assert js["type"] == "share" and js["schemaVersion"] == present.SCHEMA_VERSION
@@ -200,19 +207,218 @@ def test_present_layers():
 def test_ledger(tmp):
     """H 省钱账单：drop 估算 + order 真实优惠**分开**（实际省下 ≠ 潜在优惠）。"""
     from src import ledger
+    from datetime import datetime
     ledger.LEDGER_FILE = tmp / "ledger.jsonl"
     ledger.append_event("drop", name="雪糕", storeCode="S1", saved=3.0)
     ledger.append_event("order", name="麦旋风", storeCode="S1",
-                        originalPrice=30.4, price=25.9, saved=4.5)
+                        originalPrice=30.4, price=25.9, saved=4.5,
+                        savingsVerified=True, savingsSource=ledger.SAVINGS_SOURCE)
+    with open(ledger.LEDGER_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"kind": "order", "ts": "2026-10-14 12:00:00",
+                            "name": "旧报价", "storeCode": "S2", "saved": 99}) + "\n")
+        f.write(json.dumps({"kind": "unknown", "ts": "2026-10-14 12:00:00",
+                            "name": "未知事件", "storeCode": "S3", "saved": 99}) + "\n")
+        f.write("[]\n")
     agg = ledger.aggregate("all")
-    assert agg["saved"] == 4.5, "实际省下应只含 order 真实优惠"
+    assert agg["saved"] == 4.5, "实际省下应只含服务端核实的订单优惠"
     assert agg["potential"] == 3.0, "潜在优惠应只含 drop 估算"
-    assert agg["drops"] == 1 and agg["orders"] == 1
+    assert agg["drops"] == 1 and agg["orders"] == 2 and agg["unverifiedOrders"] == 1
     assert agg["items"][0]["name"] == "麦旋风", "商品榜只统计真实下单，不混入 drop 估算"
+    by_status = {event["savingsStatus"]: event for event in agg["events"]}
+    assert by_status["verified"]["actualSaved"] == 4.5 and "saved" not in by_status["verified"]
+    assert by_status["potential"]["potential"] == 3.0
+    assert "saved" not in by_status["unverified"] and "actualSaved" not in by_status["unverified"]
     r = payloads_report(agg)
     assert r["type"] == "report" and r["preferredRender"] == "html"
     labels = [m["label"] for m in r["metrics"]]
-    assert "实际省下" in labels and "潜在优惠(未购买)" in labels
+    assert "实际省下" in labels and "潜在优惠(未购买)" in labels and "优惠待核实" in labels
+    assert "未购买" in r["summary"] and "不计入实际省下" in r["summary"]
+    month_agg = ledger.aggregate("month")
+    assert month_agg["saved"] == 4.5 and month_agg["orders"] == 2, \
+        "周期账单应排除缺失时间戳的历史数据"
+    calendar_ledger = tmp / "calendar-ledger.jsonl"
+    old_ledger = ledger.LEDGER_FILE
+    ledger.LEDGER_FILE = calendar_ledger
+    calendar_ledger.write_text("\n".join([
+        json.dumps({"kind": "order", "ts": "2026-10-01 00:00:00", "actualSaved": 2,
+                    "savingsVerified": True, "savingsSource": ledger.SAVINGS_SOURCE}),
+        json.dumps({"kind": "order", "ts": "2026-09-30 23:59:59", "actualSaved": 7,
+                    "savingsVerified": True, "savingsSource": ledger.SAVINGS_SOURCE}),
+        json.dumps({"kind": "order", "ts": "2026-10-13 23:00:00", "actualSaved": 3,
+                    "savingsVerified": True, "savingsSource": ledger.SAVINGS_SOURCE}),
+        json.dumps({"kind": "order", "ts": "2026-10-06 00:00:00", "actualSaved": 5,
+                    "savingsVerified": True, "savingsSource": ledger.SAVINGS_SOURCE}),
+        json.dumps({"kind": "order", "name": "無時間記錄", "actualSaved": 50,
+                    "savingsVerified": True, "savingsSource": ledger.SAVINGS_SOURCE}),
+    ]) + "\n", encoding="utf-8")
+    now = datetime(2026, 10, 14, 12, 0, 0)
+    assert ledger.aggregate("month", now=now)["saved"] == 10
+    assert ledger.aggregate("week", now=now)["saved"] == 3
+    assert ledger.aggregate("today", now=now)["saved"] == 0
+    ledger.LEDGER_FILE = old_ledger
+    try:
+        ledger.append_event("other", saved=100)
+        assert False, "未知事件类型必须拒绝"
+    except ValueError:
+        pass
+
+
+def test_order_savings_verification(tmp):
+    """草稿报价不得记为实际省下，必须读 query-order.totalDiscountAmount。"""
+    from src import ledger
+
+    old_ledger, old_receipts = ledger.LEDGER_FILE, order_exec.RECEIPT_LOG
+    ledger.LEDGER_FILE = tmp / "verified-ledger.jsonl"
+    order_exec.RECEIPT_LOG = tmp / "verified-receipts.jsonl"
+
+    class Client:
+        def order_list(self):
+            return {"data": {"list": []}}
+
+        def call(self, name, arguments=None, confirm=False):
+            assert name == "create-order" and confirm is True
+            return {"data": {"orderId": "order-1"}}
+
+        def query_order(self, order_id):
+            assert order_id == "order-1"
+            return {"data": {"totalDiscountAmount": "2.75"}}
+
+    draft = {
+        "storeCode": "S1", "takeWayCode": "T1", "items": [{"name": "套餐", "quantity": 1}],
+        "originalPrice": 10, "price": 5, "discount": 5,
+        "confirmedByHuman": True, "confirmedAt": "2026-10-14 12:00:00",
+        "confirmedText": order_exec.CONFIRM_TEXT,
+    }
+    try:
+        receipt = order_exec.execute_draft(Client(), draft)
+        agg = ledger.aggregate("all")
+        assert receipt["savingsVerification"]["verified"] is True
+        assert receipt["savingsVerification"]["ledgerRecorded"] is True
+        assert agg["saved"] == 2.75, "应使用订单详情金额，不用草稿中的 5 元报价"
+
+        class MissingDetail(Client):
+            def call(self, name, arguments=None, confirm=False):
+                return {"data": {"orderId": "order-2"}}
+
+            def query_order(self, order_id):
+                raise RuntimeError("detail unavailable")
+
+        receipt2 = order_exec.execute_draft(MissingDetail(), draft)
+        agg2 = ledger.aggregate("all")
+        assert receipt2["savingsVerification"]["verified"] is False
+        assert agg2["saved"] == 2.75 and agg2["unverifiedOrders"] == 1
+    finally:
+        ledger.LEDGER_FILE = old_ledger
+        order_exec.RECEIPT_LOG = old_receipts
+
+
+def test_local_data_management(tmp):
+    """导出永远剔除 Token；脱敏只生成副本；删除仅处理明确登记的范围。"""
+    import zipfile
+    from unittest.mock import patch
+    from src import local_data
+
+    cache = tmp / "cache"
+    config = tmp / "config.local.json"
+    generated = tmp / "generated"
+    (cache / "drafts").mkdir(parents=True)
+    (cache / "ledger.jsonl").write_text(
+        json.dumps({"kind": "order", "orderId": "OID-123", "storeCode": "S1",
+                    "address": "Shenzhen Road", "name": "汉堡"}) + "\n", encoding="utf-8")
+    (cache / "drafts" / "draft.json").write_text(
+        json.dumps({"authorization": "Bearer TOKEN-SECRET", "note": "地址: 某某路"}), encoding="utf-8")
+    (cache / "product_profile.json").write_text(json.dumps({"麦旋风": {"buyCount": 5}}), encoding="utf-8")
+    (cache / "store_names.json").write_text(json.dumps({"S1": "测试店"}), encoding="utf-8")
+    (cache / "processed_order_ids.json").write_text(json.dumps(["OID-123"]), encoding="utf-8")
+    (cache / "meals_snapshot").mkdir()
+    snapshot = cache / "meals_snapshot" / "1421252-secret-store.json"
+    snapshot.write_text(json.dumps({"storeCode": "1421252", "storeName": "Secret Store",
+                                    "meals": [{"productCode": "P987", "productName": "Secret Burger"}]}),
+                        encoding="utf-8")
+    (cache / "unmanaged.txt").write_text("keep me", encoding="utf-8")
+    config.write_text(json.dumps({"mcp_token": "TOKEN-SECRET", "user": {
+        "nickname": "测试用户", "default_address": "Shenzhen Road", "favorite_stores": ["S1"]
+    }}), encoding="utf-8")
+    generated.mkdir()
+    (generated / "report.html").write_text(
+        "<p>地址: Shenzhen Road</p><p>Authorization: Bearer SECOND-SECRET;</p>", encoding="utf-8")
+    (generated / "share.svg").write_text("<svg><text>Secret Store</text></svg>", encoding="utf-8")
+
+    with patch.object(local_data, "CACHE_DIR", cache), \
+            patch.object(local_data, "LOCAL_CONFIG", config), \
+            patch.object(local_data, "GENERATED_DIR", generated):
+        status = local_data.status()
+        assert status["groups"][0]["unmanagedFiles"] == 1
+        assert status["totalFiles"] == 10 and status["groups"][0]["managedFiles"] == 6
+
+        backup = tmp / "backup.zip"
+        local_data.export_archive(backup)
+        with zipfile.ZipFile(backup) as archive:
+            contents = {name: archive.read(name) for name in archive.namelist()}
+        assert all(b"TOKEN-SECRET" not in value and b"SECOND-SECRET" not in value
+                   for value in contents.values())
+        assert b"Shenzhen Road" in contents["project/config.local.json"]
+        assert "cache/unmanaged.txt" not in contents
+
+        original_config = config.read_bytes()
+        original_snapshot = snapshot.read_bytes()
+        redacted = tmp / "redacted.zip"
+        local_data.export_archive(redacted, redact=True)
+        with zipfile.ZipFile(redacted) as archive:
+            redacted_data = {name: archive.read(name) for name in archive.namelist()}
+        redacted_manifest = json.loads(redacted_data["manifest.json"])
+        packed = b"".join(redacted_data.values())
+        assert b"TOKEN-SECRET" not in packed and b"SECOND-SECRET" not in packed
+        assert b"Shenzhen Road" not in packed
+        assert b"[\xe5\xb7\xb2\xe8\x84\xb1\xe6\x95\x8f]" in packed
+        assert "generated" in redacted_manifest["excludedGroups"]
+        assert {"cache/product_profile.json", "cache/store_names.json",
+                "cache/processed_order_ids.json"} <= set(redacted_manifest["excludedFiles"])
+        assert "cache/meals_snapshot" in redacted_manifest["renamedGroups"]
+        assert "cache/meals_snapshot/snapshot-001.json" in redacted_data
+        assert "1421252-secret-store" not in "\n".join(redacted_data)
+        assert b"1421252" not in packed and b"Secret Store" not in packed
+        assert "generated/report.html" not in redacted_data and "generated/share.svg" not in redacted_data
+        assert snapshot.read_bytes() == original_snapshot, "脱敏不得改写快照原文件"
+        assert config.read_bytes() == original_config, "脱敏不得改写原文件"
+        try:
+            local_data.export_archive(cache / "inside.zip")
+            assert False, "导出文件不得写入受管理目录"
+        except ValueError:
+            pass
+
+        deleted = local_data.delete()
+        assert deleted["deletedFiles"] == 6
+        assert (cache / "unmanaged.txt").exists()
+        assert config.exists() and (generated / "report.html").exists() and (generated / "share.svg").exists()
+        local_data.delete(include_config=True, include_generated=True)
+        assert not config.exists() and not generated.exists()
+
+
+def test_local_data_delete_requires_confirmation():
+    """不带精确确认时数据删除命令只能预览，不能调用删除函数。"""
+    import io
+    from contextlib import redirect_stdout
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import main
+
+    preview = {"groups": [{"managedFiles": 2}], "totalFiles": 2, "totalBytes": 10}
+    with patch.object(main.local_data, "status", return_value=preview) as status, \
+            patch.object(main.local_data, "delete") as delete:
+        for yes, text in ((False, ""), (True, "错误确认")):
+            args = SimpleNamespace(action="delete", yes=yes, confirm_text=text,
+                                   include_config=True, include_generated=True, format="text")
+            output = io.StringIO()
+            try:
+                with redirect_stdout(output):
+                    main.cmd_data(args)
+                assert False, "删除命令缺少精确确认时应拒绝"
+            except SystemExit as exc:
+                assert exc.code == 4
+            assert "--include-config --include-generated" in output.getvalue()
+        assert status.call_count == 2
+        delete.assert_not_called()
 
 
 def payloads_report(agg):
@@ -330,13 +536,15 @@ def test_phrases():
         ("麦旋风现在多少钱", "best"), ("今天吃麦当劳哪个划算", "best"),
         ("确认下单", "order"), ("算了先别买", "cancel"),
         ("取消所有未支付订单", "cancel_unpaid"),
-        ("我一共省了多少钱", "report"), ("发个战报", "share"),
+        ("我一共省了多少钱", "report"), ("发个战报", "report"),
+        ("分享这单优惠方案", "share"),
         ("怎么用你", "doctor"), ("你好，你会干嘛", "capabilities"),
     ]
     for say, expect in cases:
         hit = ph.match(say)
         assert hit is not None, f"未匹配: {say}"
         assert hit["intent"] == expect, f"「{say}」→ {hit['intent']}，期望 {expect}"
+    assert ph.match("发个战报")["intent"] == "report", "战报应展示已核实账单，而不是待下单报价"
 
     # 红线：花钱/写入类意图一律不可自动执行
     assert ph.runnable("patrol") and ph.runnable("report")
@@ -490,6 +698,8 @@ def test_repeat_schedule():
         s = sch.add(kind="alert", at="09:00", note="两次", days=2)
         sch.fire(sch._NoMoneyClient(McdClient("x")), s)
         assert sch.list_all()[0]["status"] == "pending" and sch.list_all()[0]["fireCount"] == 1
+        # 模拟跨到下一日；重复计划每个自然日最多触发一次。
+        sch._mark(s["id"], lastFiredDate="1900-01-01")
         sch.fire(sch._NoMoneyClient(McdClient("x")), s)
         assert sch.list_all()[0]["status"] == "fired" and sch.list_all()[0]["fireCount"] == 2
 
@@ -566,26 +776,26 @@ def test_message_format():
 
 
 def test_confirm_format_edge():
-    """省 0 元不显示「省」；inline 卡片不把 command 贴给用户。"""
+    """零优惠不额外显示金额；正数报价标为预计优惠。"""
     from src import payloads, present
 
-    # 省 0：metrics 不含「省」指标，summary 不提「省 0」
+    # 零优惠：metrics 不含预计优惠指标，summary 不提预计金额
     p0 = payloads.confirm_from_draft({
         "storeCode": "1421252", "storeName": "测试店", "takeWayName": "堂食",
         "items": [{"productCode": "4810", "name": "薯条", "quantity": 2, "subtotal": 29.0}],
         "coupon": None, "price": 29.0, "originalPrice": 29.0, "discount": 0.0,
     }, "d.json")
     assert p0["type"] == "confirm"
-    assert "省" not in [m["label"] for m in p0["metrics"]]
-    assert "省" not in p0["summary"]
+    assert "预计优惠" not in [m["label"] for m in p0["metrics"]]
+    assert "预计优惠" not in p0["summary"]
 
-    # 省 > 0：仍显示「省」
+    # 报价优惠 > 0：显示「预计优惠」
     p1 = payloads.confirm_from_draft({
         "storeCode": "1421252", "storeName": "测试店",
         "items": [{"productCode": "4810", "name": "薯条", "quantity": 2}],
         "coupon": None, "price": 25.0, "originalPrice": 29.0, "discount": 4.0,
     }, "d.json")
-    assert "省" in [m["label"] for m in p1["metrics"]]
+    assert "预计优惠" in [m["label"] for m in p1["metrics"]]
 
     # inline 渲染不把 command 贴给用户（那是给 Agent 执行的指令）
     txt = present.render_inline(p1)
@@ -616,6 +826,7 @@ def test_confirm_gate_hardening():
     # 报价过期（TTL）→ 拒绝
     old = dict(draft)
     old["quotedAt"] = (datetime.now() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+    old["digest"] = order_exec.draft_digest(old)
     ok, reason = order_exec.validate_for_order(old)
     assert not ok and "过期" in reason
 
@@ -955,6 +1166,15 @@ def test_uncertain_order_probe():
     assert r3["status"] == "uncertain" and r3["probe"]["queried"] is False
     assert fc.create_calls == 1
 
+    old_receipt_log = order_exec.RECEIPT_LOG
+    with tempfile.TemporaryDirectory() as td:
+        order_exec.RECEIPT_LOG = Path(td)  # 目录不能作为日志文件写入
+        try:
+            r4 = order_exec.execute_draft(FakeB(), draft)
+            assert r4["status"] == "uncertain" and r4["receiptLogRecorded"] is False
+        finally:
+            order_exec.RECEIPT_LOG = old_receipt_log
+
 
 def test_draft_binding_hardening():
     """确认绑定草稿：强制 digest、diff 比较门店/取餐/预约、草稿 ID 不重复。"""
@@ -1159,8 +1379,8 @@ def test_digest_covers_full_items():
 
     # 完整链路：篡改 roundList 后 validate_for_order 拒绝（digest 对不上）
     draft = dict(base)
-    draft["digest"] = order_exec.draft_digest(base)
     draft["quotedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    draft["digest"] = order_exec.draft_digest(draft)
     ok, _ = order_exec.validate_for_order(draft)
     assert ok, "原始草稿应通过"
     tampered = json.loads(json.dumps(draft))
@@ -1209,8 +1429,8 @@ def test_digest_covers_request_fields():
 
     # ⑤ 完整链路：篡改 beType 后 validate_for_order 拒绝（digest 对不上）
     draft = dict(base)
-    draft["digest"] = order_exec.draft_digest(base)
     draft["quotedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    draft["digest"] = order_exec.draft_digest(draft)
     assert order_exec.validate_for_order(draft)[0], "原始草稿应通过"
     tampered = json.loads(json.dumps(draft))
     tampered["beType"] = 2
@@ -1250,6 +1470,10 @@ def test_build_argv_no_shell():
     # 留空占位符：未给 --draft 时，空占位符连同其 flag 一起丢弃
     argv4 = ph.build_argv('python main.py share --draft <草稿.json>', draft="")
     assert argv4 == ["python", "main.py", "share"]
+
+    argv5 = ph.build_argv(
+        'python main.py best --store <门店code> --items "<商品> x1"')
+    assert argv5 == ["python", "main.py", "best"]
 
 
 def test_phrase_propagates_exit_code():
@@ -1641,6 +1865,232 @@ def test_dual_candidates():
 
 
 
+def test_review_quoted_at_is_bound_and_validated():
+    """报价时间必须进入摘要，并拒绝缺失、非法或未来报价时间。"""
+    from datetime import datetime, timedelta
+
+    base = {"storeCode": "S1", "takeWayCode": "T1", "items": [],
+            "price": 1.0, "originalPrice": 2.0}
+    now = datetime(2026, 10, 14, 12, 0, 0)
+    draft = {**base, "quotedAt": "2026-10-14 11:59:00"}
+    draft["digest"] = order_exec.draft_digest(draft)
+    assert order_exec.validate_for_order(draft, now=now)[0]
+
+    tampered = {**draft, "quotedAt": "2026-10-14 11:58:00"}
+    assert order_exec.draft_digest(tampered) != draft["digest"]
+    assert not order_exec.validate_for_order(tampered, now=now)[0]
+
+    for quoted in (None, "not-a-date", (now + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")):
+        invalid = {**base}
+        if quoted is not None:
+            invalid["quotedAt"] = quoted
+        invalid["digest"] = order_exec.draft_digest(invalid)
+        ok, reason = order_exec.validate_for_order(invalid, now=now)
+        assert not ok and "报价时间" in reason
+
+
+def test_review_repeat_order_completion_keeps_schedule_active():
+    """重复下单计划在成功确认一期后继续执行剩余天数。"""
+    from src import schedule as sch
+
+    with tempfile.TemporaryDirectory() as td:
+        old = sch.SCHEDULE_FILE
+        sch.SCHEDULE_FILE = Path(td) / "schedules.json"
+        try:
+            s = sch.add(kind="order", at="08:00", store="S1",
+                        items="麦旋风 x1", days=3)
+            sch._mark(s["id"], fireCount=1, status="pending")
+            assert sch.complete(s["id"])
+            current = sch._get(s["id"])
+            assert current["status"] == "pending"
+            assert len(sch.list_all(only_pending=True)) == 1
+
+            sch._mark(s["id"], fireCount=3, status="fired")
+            assert sch.complete(s["id"])
+            assert sch._get(s["id"])["status"] == "done"
+        finally:
+            sch.SCHEDULE_FILE = old
+
+
+def test_review_stale_schedule_claim_recovers():
+    """进程崩溃遗留的 firing claim 超时后可重新触发。"""
+    from datetime import datetime
+    from src import schedule as sch
+
+    with tempfile.TemporaryDirectory() as td:
+        old = sch.SCHEDULE_FILE
+        old_outbox, old_lock = sch.OUTBOX_DIR, sch.FIRE_LOCK_FILE
+        sch.SCHEDULE_FILE = Path(td) / "schedules.json"
+        sch.OUTBOX_DIR = Path(td) / "outbox"
+        sch.FIRE_LOCK_FILE = Path(td) / ".fire.lock"
+        now = datetime(2026, 10, 14, 9, 0, 0)
+        try:
+            sch.SCHEDULE_FILE.write_text(json.dumps([{
+                "id": "sch-stale", "kind": "alert", "at": "08:00",
+                "time": "08:00:00", "date": None, "repeatDays": 0,
+                "fireCount": 0, "status": "firing",
+                "claimedAt": "2026-10-14 08:00:00",
+            }]), encoding="utf-8")
+            due = sch.due(now=now)
+            assert [item["id"] for item in due] == ["sch-stale"]
+            current = sch._get("sch-stale")
+            assert current["status"] == "pending" and current["claimedAt"] is None
+            result = sch.fire(sch._NoMoneyClient(None), due[0])
+            assert not result.get("skipped")
+            assert sch._get("sch-stale")["status"] == "fired"
+        finally:
+            sch.SCHEDULE_FILE = old
+            sch.OUTBOX_DIR, sch.FIRE_LOCK_FILE = old_outbox, old_lock
+
+
+def test_review_doctor_accepts_environment_token_without_local_file():
+    """doctor 不应把受支持的环境变量 Token 判成未配置。"""
+    import os
+    from src import config as cfgmod, onboarding
+
+    with tempfile.TemporaryDirectory() as td:
+        old_path, old_cache = cfgmod.LOCAL_CONFIG, cfgmod._cache
+        old_token = os.environ.get("MCD_MCP_TOKEN")
+        cfgmod.LOCAL_CONFIG = Path(td) / "config.local.json"
+        cfgmod._cache = None
+        os.environ["MCD_MCP_TOKEN"] = "offline-test-token"
+        try:
+            result = onboarding.doctor(check_token=False)
+            checks = {item["name"]: item for item in result["checks"]}
+            assert checks["config.local.json"]["ok"] is None
+            assert checks["MCP Token"]["ok"] is True
+            assert "offline-test-token" not in result["text"]
+        finally:
+            cfgmod.LOCAL_CONFIG, cfgmod._cache = old_path, old_cache
+            if old_token is None:
+                os.environ.pop("MCD_MCP_TOKEN", None)
+            else:
+                os.environ["MCD_MCP_TOKEN"] = old_token
+
+
+def test_review_delivery_rejects_missing_be_code_from_service():
+    """调用方提供 beCode 时，接口缺少 beCode 也不能视为匹配成功。"""
+    from src import optimize
+
+    class Client:
+        def delivery_addresses(self):
+            return {"data": {"addresses": []}}
+
+        def delivery_stores(self, address_id, be_type=2):
+            return {"data": [{"storeCode": "S1", "businessStatus": "营业中"}]}
+
+    try:
+        optimize.resolve_delivery(Client(), "A1", store_code="S1", be_code="B1")
+        assert False, "服务端未返回 beCode 时应拒绝未验证的组合"
+    except ValueError as exc:
+        assert "beCode" in str(exc)
+
+
+def test_review_patrol_failure_is_not_reported_as_no_deals():
+    """所有门店巡检失败时输出失败状态，不能伪装成没有优惠。"""
+    from src import payloads
+
+    p = payloads.alert_price_drop([], scanned=0, scan_errors=2)
+    assert p["title"] == "巡检失败"
+    assert "没有新优惠" not in p["summary"]
+    partial = payloads.alert_price_drop([], scanned=1, scan_errors=1)
+    assert "部分门店巡检失败" in partial["meta"]["hint"]
+
+
+def test_review_phrase_run_does_not_invent_store_or_item():
+    """phrase --run 缺少门店/商品时应询问，不用硬编码默认值执行。"""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import main
+    from src import phrases as ph
+
+    argv = ph.build_argv('python main.py best --store <门店code> --items "<商品> x1"')
+    assert "1421252" not in argv and "麦旋风 x1" not in argv
+    args = SimpleNamespace(text="麦旋风现在多少钱", run=True, store="", item="",
+                           draft="", address_id="")
+    with patch("subprocess.run") as run:
+        main.cmd_phrase(args)
+        run.assert_not_called()
+
+
+def test_review_uncertain_order_probe_supports_common_list_fields():
+    """不确定订单结果探测兼容 MCP 常见订单数组字段名。"""
+    from src.mcd_client import NetworkError
+
+    with tempfile.TemporaryDirectory() as td:
+        old_log = order_exec.RECEIPT_LOG
+        order_exec.RECEIPT_LOG = Path(td) / "receipts.jsonl"
+        try:
+            for field in ("orders", "orderList", "records"):
+                class Client:
+                    def __init__(self):
+                        self.created = False
+
+                    def order_list(self):
+                        rows = ([{"orderId": "new", "orderStatus": "待支付"}]
+                                if self.created else [])
+                        return {"data": {field: rows}}
+
+                    def call(self, name, args=None, confirm=False):
+                        self.created = True
+                        raise NetworkError("connection lost")
+
+                draft = {"storeCode": "S1", "takeWayCode": "T1", "items": [],
+                         "price": 1.0, "originalPrice": 1.0,
+                         "confirmedByHuman": True, "confirmedAt": "2026-10-14 12:00:00",
+                         "confirmedText": "确认下单"}
+                result = order_exec.execute_draft(Client(), draft)
+                assert result["probe"]["newUnpaidOrder"] is True, field
+        finally:
+            order_exec.RECEIPT_LOG = old_log
+
+
+def test_review_welcome_survives_legacy_console_encoding():
+    """Windows GBK 控制台不能让欢迎页因 emoji 而崩溃。"""
+    import os
+    import subprocess
+
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "gbk:strict"
+    result = subprocess.run([sys.executable, "main.py"], cwd=Path(__file__).resolve().parent.parent,
+                            env=env, capture_output=True, text=True,
+                            encoding="gbk", errors="replace")
+    assert result.returncode == 0, result.stderr
+    assert "首次使用三步" in result.stdout
+
+
+def test_review_python39_postpones_union_annotations():
+    """使用 Python 3.10 联合注解的模块都必须启用延迟求值，兼容 3.9。"""
+    import ast
+    import __future__
+
+    root = Path(__file__).resolve().parent.parent
+    files = [root / "main.py", *sorted((root / "src").glob("*.py"))]
+    for path in files:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path), feature_version=(3, 9))
+        uses_union = False
+        for node in ast.walk(tree):
+            annotation = None
+            if isinstance(node, ast.arg):
+                annotation = node.annotation
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                annotation = node.returns
+            elif isinstance(node, ast.AnnAssign):
+                annotation = node.annotation
+            if annotation and any(isinstance(child, ast.BinOp) and
+                                  isinstance(child.op, ast.BitOr)
+                                  for child in ast.walk(annotation)):
+                uses_union = True
+                break
+        if uses_union:
+            postponed = any(isinstance(node, ast.ImportFrom)
+                            and node.module == "__future__"
+                            and any(alias.name == "annotations" for alias in node.names)
+                            for node in tree.body)
+            assert postponed, f"{path} 需要 from __future__ import annotations"
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1653,6 +2103,9 @@ def main():
         test_recipe_and_gate(tmp)
         test_present_layers()
         test_ledger(tmp)
+        test_order_savings_verification(tmp)
+        test_local_data_management(tmp)
+        test_local_data_delete_requires_confirmation()
         test_address_derive()
         test_config_write_whitelist()
         test_onboarding()
@@ -1690,6 +2143,16 @@ def main():
         test_auto_claim_unknown_when_query_fails()
         test_resolve_delivery_status_and_pair()
         test_dual_candidates()
+        test_review_quoted_at_is_bound_and_validated()
+        test_review_repeat_order_completion_keeps_schedule_active()
+        test_review_stale_schedule_claim_recovers()
+        test_review_doctor_accepts_environment_token_without_local_file()
+        test_review_delivery_rejects_missing_be_code_from_service()
+        test_review_patrol_failure_is_not_reported_as_no_deals()
+        test_review_phrase_run_does_not_invent_store_or_item()
+        test_review_uncertain_order_probe_supports_common_list_fields()
+        test_review_welcome_survives_legacy_console_encoding()
+        test_review_python39_postpones_union_annotations()
     print("ALL OFFLINE TESTS PASSED ✅")
 
 

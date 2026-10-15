@@ -34,6 +34,7 @@ OUTBOX_DIR = CACHE_DIR / "outbox"
 FIRE_LOCK_FILE = CACHE_DIR / ".schedule-fire.lock"
 
 RETRY_AFTER_SECONDS = 5 * 60   # 触发失败后的重试抑制窗口（避免同分钟反复补触发）
+STALE_CLAIM_SECONDS = 15 * 60  # 崩溃遗留的 firing claim 最长保留时间
 
 KIND_ORDER = "order"   # 到点重算价 → 推送确认卡（不自动下单）
 KIND_ALERT = "alert"   # 到点发一条提醒（纯文本/卡片，无副作用）
@@ -241,8 +242,15 @@ def due(schedules: list[dict] | None = None, now: datetime | None = None) -> lis
       · 仅一次（repeatDays=0）：今天到点且尚未触发过。
     """
     now = now or datetime.now()
+    if schedules is None:
+        try:
+            with _exclusive_lock(FIRE_LOCK_FILE):
+                schedules = _recover_stale_claims(now)
+        except LockBusyError:
+            # 正常触发仍持锁；不尝试恢复，等下一轮调度再检查。
+            schedules = _load()
     out = []
-    for s in (schedules if schedules is not None else list_all()):
+    for s in schedules:
         if s.get("status") != "pending":
             continue
         # 失败重试抑制：上次触发失败后，nextRetryAt 之前不再补触发
@@ -281,6 +289,30 @@ def due(schedules: list[dict] | None = None, now: datetime | None = None) -> lis
             if int(s.get("fireCount") or 0) == 0:
                 out.append(s)
     return out
+
+
+def _recover_stale_claims(now: datetime) -> list[dict]:
+    """把进程崩溃遗留的 firing 状态恢复为 pending。"""
+    items = _load()
+    changed = False
+    cutoff = now.timestamp() - STALE_CLAIM_SECONDS
+    for s in items:
+        if s.get("status") != "firing":
+            continue
+        try:
+            claimed_at = datetime.strptime(str(s.get("claimedAt") or "")[:19],
+                                           "%Y-%m-%d %H:%M:%S").timestamp()
+            stale = claimed_at <= cutoff
+        except ValueError:
+            stale = True
+        if stale:
+            s.update(status="pending", claimedAt=None, nextRetryAt=None,
+                     lastError="上次触发进程异常退出，已自动恢复",
+                     lastErrorAt=now.strftime("%Y-%m-%d %H:%M:%S"))
+            changed = True
+    if changed:
+        _save(items)
+    return items
 
 
 def next_trigger(s: dict, now: datetime | None = None) -> str:
@@ -384,6 +416,10 @@ def _fire_locked(client, sch: dict) -> dict:
     if current.get("status") != "pending":
         return {"skipped": True, "id": sch["id"],
                 "reason": f"任务已处于 {current.get('status')} 状态，跳过"}
+    if (int(current.get("repeatDays") or 0) > 0
+            and current.get("lastFiredDate") == _today_str(datetime.now())):
+        return {"skipped": True, "id": sch["id"],
+                "reason": "该重复任务今天已触发，跳过"}
     nra = current.get("nextRetryAt")
     if nra:
         try:
@@ -484,12 +520,14 @@ def _emit(sch: dict, payload: dict, draft_path) -> dict:
 
 
 def complete(sid: str) -> bool:
-    """用户确认并下单成功后调用（由 order 命令回执联动，或手动标记）。"""
+    """确认下单成功后记录；重复计划未完成全部触发日时仍保持 pending。"""
     items = _load()
     hit = False
     for s in items:
         if s.get("id") == sid:
-            s["status"] = "done"
+            repeat_days = int(s.get("repeatDays") or 0)
+            fire_count = int(s.get("fireCount") or 0)
+            s["status"] = ("pending" if repeat_days > fire_count else "done")
             hit = True
     if hit:
         _save(items)

@@ -2,8 +2,10 @@
 """麦麦省钱助理 · 配置加载
 
 优先级：环境变量 MCD_MCP_TOKEN > config.local.json > 报错提示。
-私密信息（token/地址/称呼）只存 config.local.json（已被 .gitignore 排除）。
+个人地址/称呼只存 config.local.json；Token 可用环境变量覆盖本地配置。
 """
+from __future__ import annotations
+
 import json
 import os
 import sys

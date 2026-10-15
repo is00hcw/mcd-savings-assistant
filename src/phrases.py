@@ -82,12 +82,13 @@ PHRASES = [
      "note": "取消不可逆；先列清单，确认后才逐单取消"},
 
     # ---------- 复盘 / 分享 ----------
-    {"phrase": "我一共省了多少钱", "keys": ["省了多少", "一共省", "省了多少钱"],
+    {"phrase": "我一共省了多少钱 / 分享省钱账单", "keys": ["省了多少", "一共省", "省了多少钱", "分享省钱账单", "省钱账单", "战报"],
      "intent": "report", "cmd": "python main.py report --period month",
-     "type": "report", "note": "默认按月，可换 today/week/all"},
-    {"phrase": "发个战报 / 生成战报图", "keys": ["战报", "海报", "发个图", "分享图"],
+     "type": "report", "note": "默认按月，可换 today/week/all；实际省下与潜在优惠分开展示"},
+    {"phrase": "分享这单优惠方案 / 生成优惠方案图",
+     "keys": ["分享这单优惠方案", "生成优惠方案图", "优惠方案分享图"],
      "intent": "share", "cmd": "python main.py share --draft <草稿.json>",
-     "type": "share", "note": "图片用于对外转发，配方不含任何凭据"},
+     "type": "share", "note": "分享待下单方案；卡片展示预计优惠，不代表已省下"},
 
     # ---------- 配置 / 地址 ----------
     {"phrase": "帮我填好地址 / 我的地址在哪", "keys": ["地址", "填地址", "定位"],
@@ -108,11 +109,12 @@ def match(text: str) -> dict | None:
     if not text:
         return None
     t = str(text).strip().lower()
-    best, best_hits, best_n = None, [], 0
+    best, best_hits, best_score = None, [], 0
     for item in PHRASES:
         hits = [k for k in item["keys"] if k.lower() in t]
-        if len(hits) > best_n:
-            best, best_hits, best_n = dict(item), hits, len(hits)
+        score = sum(len(key) for key in hits)
+        if score > best_score:
+            best, best_hits, best_score = dict(item), hits, score
     if best:
         best["matchedKeys"] = best_hits
         return best
@@ -136,15 +138,22 @@ def build_argv(cmd: str, store: str = "", item: str = "", draft: str = "",
     """
     import shlex
     subs = {
-        "<门店code>": store or "1421252",
-        "<商品>": item or "麦旋风",
+        "<门店code>": store,
+        "<商品>": item,
         "<草稿.json>": draft,
         "<地址id>": address_id,
     }
     out: list[str] = []
     for tok in shlex.split(cmd):
+        missing = False
         for k, v in subs.items():
+            if k in tok and not v:
+                missing = True
             tok = tok.replace(k, v)
+        if missing:
+            if out and out[-1].startswith("-"):
+                out.pop()
+            continue
         if tok == "":
             if out and out[-1].startswith("-"):
                 out.pop()

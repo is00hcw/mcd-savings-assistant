@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""H/I · 省钱战报：order recipe（无凭据，可复现）
+"""H/I · 下单前优惠方案与 order recipe（无凭据，可复现）
 
 v0.15（方案 14.3）后职责收窄：
   - 渲染层（内联卡片 / HTML 页面 / 图片）统一由 present.py 按 payload.type 负责；
@@ -9,6 +9,7 @@ v0.15（方案 14.3）后职责收窄：
 好友侧任何 create-order 前必须由其本人确认。
 """
 import json
+from html import escape
 from datetime import datetime
 
 from .qr import qr_svg, PayloadTooLarge
@@ -46,23 +47,26 @@ def recipe_prompt(draft: dict) -> str:
 
 
 def render_card(draft: dict, drops: int = 0) -> str:
-    """渲染 HTML 战报卡（自包含，可保存/截图分享）。"""
+    """渲染 HTML 优惠方案卡；动态字段转义后再嵌入 HTML。"""
     saved = float(draft.get("discount") or 0)
     coupon = draft.get("coupon")
+    store_name = escape(str(draft.get("storeName") or draft.get("storeCode") or ""))
     coupon_line = (
-        f"本单用券「{coupon.get('name') or coupon.get('couponCode')}」 -¥{saved:g}"
+        f"报价用券「{escape(str(coupon.get('name') or coupon.get('couponCode')))}」；"
+        f"预计优惠 -¥{saved:g}"
         if coupon else "本单未用券/积分"
     )
     items = "<br>".join(
-        f"{it.get('name') or it.get('productCode')} × {it.get('quantity')}"
+        f"{escape(str(it.get('name') or it.get('productCode')))} × {escape(str(it.get('quantity')))}"
         for it in draft.get("items", [])
     )
+    recipe = escape(recipe_json(draft))
     qr_html = ""
     try:
         qr = qr_svg(recipe_json(draft), module=5)
         qr_html = f'<div class="qr">{qr}<p>好友扫码导入这单（须本人确认下单）</p></div>'
     except PayloadTooLarge as e:
-        qr_html = f'<div class="qr none"><p>（订单过大，未生成二维码）<br>{e}</p></div>'
+        qr_html = f'<div class="qr none"><p>（订单过大，未生成二维码）<br>{escape(str(e))}</p></div>'
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"/>
@@ -86,13 +90,13 @@ def render_card(draft: dict, drops: int = 0) -> str:
  .foot{{text-align:center;font-size:11px;color:#b0a880;margin-top:14px;}}
 </style></head><body>
 <div class="card"><div class="inner">
- <h1>🍔 麦麦降价战报</h1>
- <div class="sub">{datetime.now().strftime('%Y-%m-%d %H:%M')} · 门店 {draft.get('storeName', draft.get('storeCode'))}</div>
- <div class="save">省 ¥{saved:g}<br><small>到手价 ¥{draft.get('price', 0):g}（原价 ¥{draft.get('originalPrice', 0):g}）</small></div>
+ <h1>麦麦优惠方案</h1>
+ <div class="sub">{datetime.now().strftime('%Y-%m-%d %H:%M')} · 门店 {store_name}</div>
+ <div class="save">预计优惠 ¥{saved:g}<br><small>尚未下单；此金额未计入实际省下</small><br><small>报价到手价 ¥{draft.get('price', 0):g}（原价 ¥{draft.get('originalPrice', 0):g}）</small></div>
  <span class="coupon">{coupon_line}</span>
  {f'<div class="coupon" style="background:#e6f6ed;color:#1f9d55">本月抓住 {drops} 次降价</div>' if drops else ''}
  <div class="rows">{items}</div>
- <div class="recipe"><b>order recipe</b>（不含任何凭据）<br>{recipe_json(draft)}</div>
+ <div class="recipe"><b>order recipe</b>（不含任何凭据）<br>{recipe}</div>
  {qr_html}
  <div class="foot">麦麦省钱助理 · 你只管吃，省钱它来盯</div>
 </div></div></body></html>"""
