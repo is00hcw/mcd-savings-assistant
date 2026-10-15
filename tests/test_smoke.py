@@ -1786,6 +1786,77 @@ def test_reprice_display_only_fields_do_not_break_diff():
     assert "商品清单已变化" in order_exec.diff_draft(draft4, fresh4)
 
 
+def test_product_breakdown_keeps_duplicate_product_lines_distinct():
+    """相同商品拆成多行时，确认卡仍应显示各自对应的小计。"""
+    from src import optimize
+
+    draft = {
+        "storeCode": "1421252",
+        "storeName": "测试店",
+        "items": [
+            {"productCode": "4810", "name": "薯条", "quantity": 1},
+            {"productCode": "4810", "name": "薯条", "quantity": 2},
+        ],
+    }
+    result = {"data": {"productList": [
+        {"productCode": "4810", "quantity": 1, "subtotal": 100,
+         "originalSubtotal": 100, "productName": "小薯条"},
+        {"productCode": "4810", "quantity": 2, "subtotal": 250,
+         "originalSubtotal": 300, "productName": "中薯条"},
+    ]}}
+
+    optimize._attach_product_breakdown(draft, result)
+
+    assert [item["subtotal"] for item in draft["items"]] == [1.0, 2.5]
+    assert [item["unitPrice"] for item in draft["items"]] == [1.0, 1.25]
+    assert [item["originalSubtotal"] for item in draft["items"]] == [1.0, 3.0]
+    assert [item["officialName"] for item in draft["items"]] == ["小薯条", "中薯条"]
+
+    same_quantity = {
+        "storeName": "测试店",
+        "items": [
+            {"productCode": "4810", "name": "薯条", "quantity": 1,
+             "roundList": [{"id": "r1"}]},
+            {"productCode": "4810", "name": "薯条", "quantity": 1,
+             "roundList": [{"id": "r2"}]},
+        ],
+    }
+    same_quantity_result = {"data": {"productList": [
+        {"productCode": "4810", "quantity": 1, "subtotal": 100,
+         "originalSubtotal": 100, "productName": "原味薯条"},
+        {"productCode": "4810", "quantity": 1, "subtotal": 120,
+         "originalSubtotal": 120, "productName": "辣味薯条"},
+    ]}}
+
+    optimize._attach_product_breakdown(same_quantity, same_quantity_result)
+
+    assert [item["subtotal"] for item in same_quantity["items"]] == [1.0, 1.2]
+    assert [item["officialName"] for item in same_quantity["items"]] == ["原味薯条", "辣味薯条"]
+
+
+def test_product_breakdown_skips_aggregate_for_duplicate_product_lines():
+    """合并数量的 productList 记录不能冒充多个独立商品行的小计。"""
+    from src import optimize
+
+    draft = {
+        "storeCode": "1421252",
+        "storeName": "测试店",
+        "items": [
+            {"productCode": "4810", "name": "薯条", "quantity": 1},
+            {"productCode": "4810", "name": "薯条", "quantity": 2},
+        ],
+    }
+    result = {"data": {"productList": [
+        {"productCode": "4810", "quantity": 3, "subtotal": 350,
+         "originalSubtotal": 400, "productName": "薯条"},
+    ]}}
+
+    optimize._attach_product_breakdown(draft, result)
+
+    assert all("subtotal" not in item and "unitPrice" not in item
+               for item in draft["items"])
+
+
 def test_optimize_specified_coupon():
     """--coupon 具体券：只测「无券基线+该券」；不可用时 warning 注明生效时间窗，
     退回无券价，绝不静默枚举全量。"""
@@ -2250,6 +2321,8 @@ def main():
         test_lock_error_semantics()
         test_reprice_preserves_items()
         test_reprice_display_only_fields_do_not_break_diff()
+        test_product_breakdown_keeps_duplicate_product_lines_distinct()
+        test_product_breakdown_skips_aggregate_for_duplicate_product_lines()
         test_optimize_specified_coupon()
         test_schedule_coupon_passthrough()
         test_auto_claim_unknown_when_query_fails()

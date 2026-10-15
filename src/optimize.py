@@ -295,13 +295,51 @@ def _attach_product_breakdown(draft: dict, calc_result: dict):
     d = calc_result.get("data") if isinstance(calc_result, dict) else calc_result
     d = d if isinstance(d, dict) else {}
     plist = d.get("productList") or []
+    items = draft.get("items", [])
+
+    def quantity_key(value):
+        if value in (None, ""):
+            return ""
+        try:
+            return str(int(value))
+        except (TypeError, ValueError):
+            return str(value)
+
+    item_counts = {}
+    item_counts_by_code = {}
+    for it in items:
+        code = str(it.get("productCode") or "")
+        key = (code, quantity_key(it.get("quantity") or 1))
+        item_counts[key] = item_counts.get(key, 0) + 1
+        item_counts_by_code[code] = item_counts_by_code.get(code, 0) + 1
+
     by_code = {}
+    by_code_and_quantity = {}
+    product_counts = {}
     for p in plist:
         code = str(p.get("productCode") or "")
         if code:
-            by_code[code] = p
-    for it in draft.get("items", []):
-        p = by_code.get(str(it.get("productCode") or ""))
+            by_code.setdefault(code, []).append(p)
+            quantity = quantity_key(p.get("quantity"))
+            if quantity:
+                key = (code, quantity)
+                by_code_and_quantity.setdefault(key, []).append(p)
+                product_counts[key] = product_counts.get(key, 0) + 1
+
+    for it in items:
+        code = str(it.get("productCode") or "")
+        key = (code, quantity_key(it.get("quantity") or 1))
+        candidates = by_code_and_quantity.get(key, [])
+        if candidates and item_counts[key] == product_counts[key]:
+            p = candidates.pop(0)
+        else:
+            # Without quantity, only a single input row and response row are unambiguous.
+            rows = by_code.get(code, [])
+            if (item_counts_by_code.get(code) == 1 and len(rows) == 1
+                    and quantity_key(rows[0].get("quantity")) == ""):
+                p = rows[0]
+            else:
+                continue
         if not p:
             continue
         qty = int(p.get("quantity") or it.get("quantity") or 1)
