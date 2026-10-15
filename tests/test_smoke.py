@@ -1675,6 +1675,117 @@ def test_reprice_preserves_items():
         pass
 
 
+def _reprice_display_fake_client(coupon_price=None, product_list=True):
+    """重算展示字段测试专用 Fake：可调报价，可开关 productList 回填。"""
+    from src.mcd_client import McpError
+
+    calls = []
+
+    class Fake:
+        def call(self, name, args=None, confirm=False):
+            calls.append((name, args))
+            if name == "query-meals":
+                return {"data": {"meals": {
+                    "4810": {"name": "薯条", "code": "4810",
+                             "currentPrice": 12.5, "originalPrice": 12.5},
+                }}}
+            if name == "query-my-coupons":
+                return {"data": {"coupons": _DISPLAY_TEST_COUPONS}}
+            if name == "query-store-coupons":
+                return {"data": {"coupons": []}}
+            if name == "calculate-price":
+                code = (args["items"][0] or {}).get("couponCode")
+                price = (coupon_price if coupon_price is not None else 2500) if code == "AAA" else 2500
+                data = {"price": price, "originalPrice": 2500, "discount": 0,
+                        "takeWayList": [{"code": "eat-in", "title": "堂食"}],
+                        "storeName": "测试店"}
+                if product_list:
+                    data["productList"] = [{"productCode": "4810", "quantity": 2,
+                                            "subtotal": price,
+                                            "originalSubtotal": 2500,
+                                            "productName": "中薯条"}]
+                return {"data": data}
+            raise AssertionError(f"不应调用 {name}")
+
+        def meals(self, store_code, **kw):
+            return self.call("query-meals", kw or {})
+
+        def my_coupons(self):
+            return self.call("query-my-coupons")
+
+        def store_coupons(self, store_code, **kw):
+            return self.call("query-store-coupons")
+
+    return Fake()
+
+
+_DISPLAY_TEST_COUPONS = [
+    {"id": "C1", "code": "AAA", "title": "生效券",
+     "tradeStartDateTime": "2026-10-01 00:00:00",
+     "tradeEndDateTime": "2026-10-31 23:59:59"},
+]
+
+
+def _display_base_draft():
+    """一份带套餐规格、原价 25 的薯条草稿（展示字段可调）。"""
+    return {
+        "storeCode": "1421252", "storeName": "测试店", "takeWayCode": "eat-in",
+        "takeWayName": "堂食", "orderType": 1, "beType": 1, "beCode": "",
+        "addressId": "", "addressText": "", "deliveryFee": 0.0, "packingFee": 0.0,
+        "items": [{"productCode": "4810", "name": "薯条", "quantity": 2,
+                   "roundList": [{"id": "r1", "name": "原味"}],
+                   "spec": "大份"}],
+        "coupon": None, "price": 25.0, "originalPrice": 25.0, "discount": 0,
+        "reservationDate": None, "quotedAt": "2026-10-13 18:00:00",
+    }
+
+
+def test_reprice_display_only_fields_do_not_break_diff():
+    """P1 回归：展示字段（unitPrice/subtotal/originalSubtotal/officialName）只服务
+    于确认卡展示，却会被 _items_fingerprint 计入「商品清单」指纹。重算时它们一律以
+    原草稿为准，不得让 diff 凭空报「商品清单已变化」把定制商品误拦；而套餐规格的
+    真实变化仍必须如实报出来。"""
+    from src import optimize, order_exec
+
+    # ① 原草稿无展示字段：重算不得凭空补上（否则 diff 误报）
+    cli = _reprice_display_fake_client()
+    draft = _display_base_draft()
+    fresh = optimize.reprice_draft(cli, draft)
+    assert "unitPrice" not in fresh["items"][0]
+    assert "subtotal" not in fresh["items"][0]
+    assert order_exec.diff_draft(draft, fresh) == []
+
+    # ② 原草稿有展示字段：照抄原值，报价变化只报价格、不报商品清单
+    cli2 = _reprice_display_fake_client(coupon_price=2000)
+    draft2 = _display_base_draft()
+    draft2["items"][0]["unitPrice"] = 12.5
+    draft2["items"][0]["subtotal"] = 25.0
+    fresh2 = optimize.reprice_draft(cli2, draft2)
+    assert fresh2["items"][0]["subtotal"] == 25.0
+    assert fresh2["items"][0]["unitPrice"] == 12.5
+    changes = order_exec.diff_draft(draft2, fresh2)
+    assert "商品清单已变化" not in changes, changes
+    assert any("到手价" in c for c in changes), changes
+
+    # ③ 本次 productList 缺失：原展示字段被抹掉同样不得误报
+    cli3 = _reprice_display_fake_client(product_list=False)
+    draft3 = _display_base_draft()
+    draft3["items"][0]["subtotal"] = 25.0
+    draft3["items"][0]["officialName"] = "中薯条"
+    fresh3 = optimize.reprice_draft(cli3, draft3)
+    assert fresh3["items"][0]["subtotal"] == 25.0
+    assert order_exec.diff_draft(draft3, fresh3) == []
+
+    # ④ 规格本身被改：仍必须报「商品清单已变化」（防止裁剪过头放过真实差异）
+    cli4 = _reprice_display_fake_client()
+    draft4 = _display_base_draft()
+    draft4["items"][0]["spec"] = "大份"
+    draft4["items"][0]["subtotal"] = 25.0
+    fresh4 = optimize.reprice_draft(cli4, draft4)
+    fresh4["items"][0]["spec"] = "小份"      # 模拟服务端返回了不同规格
+    assert "商品清单已变化" in order_exec.diff_draft(draft4, fresh4)
+
+
 def test_optimize_specified_coupon():
     """--coupon 具体券：只测「无券基线+该券」；不可用时 warning 注明生效时间窗，
     退回无券价，绝不静默枚举全量。"""
@@ -2138,6 +2249,7 @@ def main():
         test_raw_readonly_gate()
         test_lock_error_semantics()
         test_reprice_preserves_items()
+        test_reprice_display_only_fields_do_not_break_diff()
         test_optimize_specified_coupon()
         test_schedule_coupon_passthrough()
         test_auto_claim_unknown_when_query_fails()

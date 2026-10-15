@@ -410,6 +410,40 @@ def draft_to_json(draft: dict) -> str:
     return json.dumps(draft, ensure_ascii=False, indent=2)
 
 
+def _mirror_item_display_fields(fresh: dict, original: dict) -> None:
+    """让重算草稿的 item 展示字段与原草稿逐项一致，避免 diff 误报。
+
+    unitPrice / subtotal / originalSubtotal / officialName 由 _attach_product_breakdown
+    从**本次** calculate-price 的 productList 回填，只服务于确认卡/分享卡展示，
+    却被 _items_fingerprint 计入「商品清单」指纹。于是原草稿没有这些字段、或本次
+    productList 缺失/金额不同，都会凭空 diff 出「商品清单已变化」，把本该放行的
+    下单误拦——带套餐规格的定制商品首当其冲。
+
+    重算草稿只用于和「用户看过的那份草稿」比对价格/券/规格是否变了（cmd_order 里
+    diff 通过后仍执行原草稿），故其展示字段一律以原草稿为准：原草稿没有就不补，
+    原草稿有就照抄，绝不参与 diff。商品规格（roundList / modification / 替换项 等）
+    不在此列，任何变化都必须如实呈现。
+    """
+    def key(it: dict) -> tuple:
+        return (str(it.get("productCode") or ""), str(it.get("quantity") or ""))
+
+    display_only = ("unitPrice", "subtotal", "originalSubtotal", "officialName")
+    old_by_key: dict[tuple, list[dict]] = {}
+    for it in original.get("items") or []:
+        old_by_key.setdefault(key(it), []).append(it)
+
+    for it in fresh.get("items") or []:
+        bucket = old_by_key.get(key(it))
+        if not bucket:
+            continue  # 新增/换商品：交给 diff 如实呈现
+        old_item = bucket.pop(0)
+        for f in display_only:
+            if f in old_item:
+                it[f] = old_item[f]
+            else:
+                it.pop(f, None)
+
+
 def reprice_draft(client, draft: dict) -> dict:
     """确认前重新算价：按草稿的 store/items 重新最优算价，返回最新 draft。
 
@@ -441,6 +475,7 @@ def reprice_draft(client, draft: dict) -> dict:
     fresh["reservationDate"] = draft.get("reservationDate")
     fresh["addressId"] = draft.get("addressId") or ""
     fresh["addressText"] = draft.get("addressText") or ""
+    _mirror_item_display_fields(fresh, draft)
     return fresh
 
 
