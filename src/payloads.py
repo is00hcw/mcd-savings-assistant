@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from . import present, persona, order_exec, coupons
+from . import present, persona, order_exec, coupons, price_memory
 
 
 # ---------------------------------------------------------------------------
@@ -14,6 +14,7 @@ from . import present, persona, order_exec, coupons
 def alert_price_drop(events: list[dict], nick: str = "老大",
                      scanned: int = 0, scan_errors: int = 0) -> dict:
     """盯价巡检的降价/新低 → alert payload。"""
+    events = price_memory.dedupe_price_events(events)
     new_lows = [e for e in events if e.get("type") in ("new_low", "dropped")]
     if not new_lows:
         if scan_errors and not scanned:
@@ -41,7 +42,7 @@ def alert_price_drop(events: list[dict], nick: str = "老大",
     metrics.append({"label": "巡检门店", "value": scanned, "unit": "家"})
     saved = 0.0
     for e in new_lows[:8]:
-        cur = float(e.get("currentPrice") or 0)
+        cur = float(e.get("currentPrice") or e.get("current") or e.get("price") or 0)
         prev = float(e.get("prevMin") or e.get("prev") or 0)
         orig = float(e.get("originalPrice") or 0)
         if prev and cur:
@@ -56,7 +57,8 @@ def alert_price_drop(events: list[dict], nick: str = "老大",
         "alert", "降价提醒", persona.on_price_drop(
             items[0]["name"],
             float(new_lows[0].get("prevMin") or new_lows[0].get("prev") or 0),
-            float(new_lows[0].get("currentPrice") or 0),
+            float(new_lows[0].get("currentPrice") or new_lows[0].get("current") or
+                  new_lows[0].get("price") or 0),
             new_lows[0].get("storeCode", "")),
         metrics=metrics, items=items,
         meta={"hint": "；".join(filter(None, [
@@ -104,9 +106,37 @@ def alert_coupon_receipt(receipt: dict, nick: str = "老大") -> dict:
         metrics.append({"label": "卡包券数", "value": wallet, "unit": "张"})
     items = [{"name": c.get("name"), "note": c.get("label") or c.get("status") or ""}
              for c in claimable[:8]]
+
+    # auto-bind 仍覆盖不到的券（多为活动营销券，官方未提供按券领取接口）→ 显式提示手动领
+    manual = receipt.get("manualRequired")
+    hint_bits = []
+    images = []
+    if isinstance(manual, list):
+        if manual:
+            metrics.append({"label": "待手动领取", "value": len(manual), "unit": "张",
+                            "emphasis": False})
+            names = "、".join(c.get("name") or "?" for c in manual[:6])
+            items.append({"name": "需到麦当劳 App 手动领",
+                          "note": f"需手动领取（auto-bind 未覆盖）：{names}"
+                                  + (" 等" if len(manual) > 6 else "")})
+            hint_bits.append(f"{len(manual)} 张活动营销券需手动领取（官方无按券领取接口，请点下方活动图片到 App 领）")
+            # 把活动 banner 图一起带回，方便用户直接去领
+            for c in manual:
+                url = c.get("image") or ""
+                if url:
+                    images.append({"url": url, "name": c.get("name") or "活动券"})
+        else:
+            hint_bits.append("auto-bind 已覆盖全部可领券")
+    elif manual is None:
+        hint_bits.append("待手动领取清单未核验，请到 App 确认")
+
+    base_hint = "；".join(receipt["errors"]) if receipt.get("errors") else "免费动作，已留回执。"
+    extra = "；".join(hint_bits)
+    meta_hint = "；".join([x for x in (base_hint, extra) if x])
     return present.make_payload(
         "alert", "领券回执", summary, metrics=metrics, items=items,
-        meta={"hint": "；".join(receipt["errors"]) if receipt.get("errors") else "免费动作，已留回执。"},
+        images=images,
+        meta={"hint": meta_hint or "免费动作，已留回执。"},
     )
 
 
@@ -307,8 +337,8 @@ def report_from_ledger(agg: dict, nick: str = "老大") -> dict:
         metrics=metrics,
         items=agg.get("items") or [],
         meta={"hint": "账本只保存在本机数据目录（默认 ~/.mcd-skill，可用 MCD_SKILL_DATA 修改）。"
-                      "「实际省下」仅含 query-order.totalDiscountAmount 已核实的订单优惠；"
-                      "旧报价和待核实订单不计入。潜在优惠是未购买的盯价估算，二者不相加。"},
+                      "「实际省下」仅含 query-order.totalDiscountAmount 且订单已支付/已完成的优惠；"
+                      "旧报价、待核实、取消和退款订单不计入。潜在优惠是未购买的盯价估算，二者不相加。"},
     )
 
 

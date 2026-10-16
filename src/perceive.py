@@ -74,6 +74,7 @@ def scan_stores(client, store_codes: list[str] | None = None,
             continue
 
         # 快照对比（跨期降价检测）
+        store_events = []
         prev = price_memory.load_snapshot(code)
         if prev:
             for k, m in idx.items():
@@ -86,24 +87,27 @@ def scan_stores(client, store_codes: list[str] | None = None,
                 except (TypeError, ValueError):
                     continue
                 if prev_p and cur_p and cur_p < prev_p:
-                    report["priceEvents"].append({
+                    store_events.append({
                         "type": "dropped", "name": m.get("name") or k,
                         "prev": prev_p, "current": cur_p, "storeCode": code,
                     })
 
-        # 刷新基线 + 低价事件
-        events = price_memory.update_from_meals(idx, code)
-        report["priceEvents"].extend(events)
+        # 刷新基线 + 低价事件；快照比较与基线比较可能描述同一次降价，先合并。
+        store_events.extend(price_memory.update_from_meals(idx, code))
+        store_events = price_memory.dedupe_price_events(store_events)
+        report["priceEvents"] = price_memory.dedupe_price_events(
+            [*report["priceEvents"], *store_events]
+        )
         price_memory.save_snapshot(code, idx)
         price_memory.merge_profile_from_meals(idx, code)
 
         # 降价事件入账本（H 省钱账单数据源，估算值）
         if record_ledger:
-            for ev in events:
+            for ev in store_events:
                 if ev.get("type") not in ("new_low", "dropped"):
                     continue
                 prev = float(ev.get("prevMin") or ev.get("prev") or 0)
-                cur = float(ev.get("currentPrice") or 0)
+                cur = float(ev.get("currentPrice") or ev.get("current") or 0)
                 if prev and cur and prev > cur:
                     try:
                         ledger.append_event(

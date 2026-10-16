@@ -54,8 +54,14 @@ def make_payload(type_: str, title: str, summary: str = "",
                  draft: dict | None = None,
                  recipe: dict | None = None,
                  meta: dict | None = None,
+                 images: list[dict] | None = None,
                  ts: str | None = None) -> dict[str, Any]:
-    """构造统一 payload。所有业务模块只调它，不直接拼字符串。"""
+    """构造统一 payload。所有业务模块只调它，不直接拼字符串。
+
+    images: 活动/券等图片列表，每项为 {"url": str, "name": str}；用于「把图片一起返回」
+            （如 auto-bind 未覆盖的营销券活动 banner），渲染层以 Markdown/HTML 呈现，
+            不承载任何可点交互（遵循 14.3 原则④：图片只展示不交互）。
+    """
     if type_ not in VALID_TYPES:
         raise ValueError(f"type 必须是 {VALID_TYPES} 之一，收到: {type_}")
     return {
@@ -68,6 +74,7 @@ def make_payload(type_: str, title: str, summary: str = "",
         "metrics": metrics or [],
         "items": items or [],
         "actions": actions or [],
+        "images": images or [],
         "draft": draft,
         "recipe": recipe,
         "meta": meta or {},
@@ -114,6 +121,15 @@ def render_inline(p: dict) -> str:
                 line += f"（{note}）"
             out.append(line)
 
+    if p["images"]:
+        out.append("")
+        out.append("🖼️ 活动图片（点开/长按识别，到麦当劳 App 领取）：")
+        for img in p["images"]:
+            url = img.get("url") or ""
+            name = img.get("name") or ""
+            if url:
+                out.append(f"![{name or '活动券'}]({url})")
+
     if p["actions"]:
         out.append("")
         for a in p["actions"]:
@@ -153,6 +169,11 @@ _HTML_TMPL = """<!DOCTYPE html>
  .sec{{margin:22px 0 10px;font-size:15px;font-weight:700}}
  .note{{margin-top:18px;padding:12px 14px;background:#fffbe6;border:1px solid #ffe08a;
    border-radius:10px;font-size:13px;color:#6b5b1f}}
+ .imgs{{display:flex;flex-wrap:wrap;gap:12px;margin-top:16px}}
+ .imgs figure{{margin:0;width:140px}}
+ .imgs img{{width:140px;height:140px;object-fit:cover;border-radius:12px;border:1px solid #e6e8eb;background:#fff}}
+ .imgs figcaption{{font-size:12px;color:#5c6573;margin-top:6px;text-align:center;
+   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
  .recipe{{margin-top:12px;background:#f2f3f5;border-radius:10px;padding:12px 14px;
    font-size:12px;color:#5c6573;word-break:break-all}}
  .foot{{margin-top:22px;text-align:center;font-size:11px;color:#a0a4ad}}
@@ -161,6 +182,7 @@ _HTML_TMPL = """<!DOCTYPE html>
 {summary_block}
 {metrics_block}
 {items_block}
+{images_block}
 {note_block}
 {recipe_block}
 <div class="foot">麦麦省钱助理 · 你的省钱盯价闹钟（数据只存本地，不收集不上传）</div>
@@ -200,6 +222,21 @@ def render_html(p: dict) -> str:
     hint = p["meta"].get("hint")
     note_block = f'<div class="note">{_esc(hint)}</div>' if hint else ""
 
+    images_block = ""
+    imgs = p.get("images") or []
+    if imgs:
+        figs = []
+        for img in imgs:
+            url = img.get("url") or ""
+            name = img.get("name") or "活动券"
+            if url:
+                figs.append(
+                    f'<figure><img src="{_esc(url)}" alt="{_esc(name)}" '
+                    f'referrerpolicy="no-referrer"/>'
+                    f'<figcaption>{_esc(name)}</figcaption></figure>')
+        if figs:
+            images_block = f'<div class="sec">活动图片（到麦当劳 App 领取）</div><div class="imgs">{"".join(figs)}</div>'
+
     recipe_block = ""
     if p.get("recipe"):
         recipe_block = ('<div class="sec">order recipe（可复现配方，不含任何凭据）</div>'
@@ -207,7 +244,8 @@ def render_html(p: dict) -> str:
     return _HTML_TMPL.format(
         title=_esc(p["title"]), icon=ICON.get(p["type"], ""), ts=_esc(p["ts"]),
         summary_block=summary_block, metrics_block=metrics_block,
-        items_block=items_block, note_block=note_block, recipe_block=recipe_block,
+        items_block=items_block, images_block=images_block,
+        note_block=note_block, recipe_block=recipe_block,
     )
 
 
@@ -338,7 +376,7 @@ def validate_payload(p: dict) -> dict:
         raise ValueError("payload 缺少必填字段 title")
     if "schemaVersion" not in p:
         raise ValueError("payload 缺少必填字段 schemaVersion")
-    for field in ("metrics", "items", "actions"):
+    for field in ("metrics", "items", "actions", "images"):
         v = p.get(field)
         if v is not None and not isinstance(v, list):
             raise ValueError(f"payload.{field} 必须是 list")

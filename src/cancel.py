@@ -73,7 +73,14 @@ def cancel_orders(client: McdClient, orders: list[dict], reason: str = DEFAULT_R
                 {"orderId": oid, "cancelReasonCode": str(reason)},
                 confirm=True,
             )
-            receipt["cancelled"].append({"orderId": oid, "result": result})
+            ledger_recorded = False
+            try:
+                from . import ledger
+                ledger_recorded = ledger.record_cancellation(oid) is not None
+            except Exception:
+                pass  # 账本失败不影响取消结果
+            receipt["cancelled"].append({"orderId": oid, "result": result,
+                                         "ledgerRecorded": ledger_recorded})
         except Exception as e:
             receipt["failed"].append({"orderId": oid, "error": str(e)})
     return receipt

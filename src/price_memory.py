@@ -23,6 +23,46 @@ SNAPSHOT_DIR = CACHE_DIR / "meals_snapshot"
 SNAPSHOT_TTL = 6 * 3600  # 菜单快照 6 小时
 
 
+def _event_number(event: dict, *keys):
+    for key in keys:
+        if event.get(key) not in (None, ""):
+            try:
+                return round(float(event[key]), 2)
+            except (TypeError, ValueError, OverflowError):
+                return None
+    return None
+
+
+def _price_event_key(event: dict):
+    product = str(event.get("productCode") or event.get("code") or "").strip()
+    if not product:
+        product = normalize_name(str(event.get("name") or ""))
+    if not product:
+        return None
+    return (
+        str(event.get("storeCode") or ""), product,
+        _event_number(event, "currentPrice", "current", "price"),
+        _event_number(event, "prevMin", "prev"),
+    )
+
+
+def dedupe_price_events(events: list[dict]) -> list[dict]:
+    """按商品/门店/前后价格合并同一次降价，优先保留信息更完整的 new_low。"""
+    priority = {"new_low": 3, "dropped": 2, "at_low": 1}
+    output: list[dict] = []
+    positions = {}
+    for event in events or []:
+        key = _price_event_key(event)
+        if key is None or key not in positions:
+            positions[key] = len(output) if key is not None else None
+            output.append(event)
+            continue
+        index = positions[key]
+        if priority.get(event.get("type"), 0) > priority.get(output[index].get("type"), 0):
+            output[index] = event
+    return output
+
+
 # ---------------------------------------------------------------------------
 # 门店名缓存（query-meals / calculate-price 都不返回门店名，
 # 只能从 order-list / query-nearby-stores 顺手记住）

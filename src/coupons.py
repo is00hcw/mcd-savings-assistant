@@ -70,12 +70,12 @@ def auto_claim(client) -> dict:
     receipt = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                "available": [], "bindResult": None,
                "walletCount": None, "claimedCount": 0, "claimedIds": [],
-               "errors": []}
+               "manualRequired": [], "errors": []}
 
     # ① 领前卡包快照（差异核验基线）
     before = _wallet_ids(client, receipt["errors"])
 
-    # ② 可领券清单
+    # ② 领前可领券清单（用于回执展示）
     try:
         avail = client.available_coupons()
         d = avail.get("data") if isinstance(avail, dict) else avail
@@ -83,7 +83,8 @@ def auto_claim(client) -> dict:
         # 实测：{couponName, couponStatus, label}；未领的才值得领
         receipt["available"] = [
             {"name": c.get("couponName") or c.get("name") or c.get("title"),
-             "status": c.get("couponStatus") or "", "label": c.get("label") or ""}
+             "status": c.get("couponStatus") or "", "label": c.get("label") or "",
+             "image": c.get("couponImage") or c.get("image") or c.get("pic") or ""}
             for c in items
         ]
     except Exception as e:
@@ -108,5 +109,22 @@ def auto_claim(client) -> dict:
     else:
         receipt["claimedIds"] = sorted(after - before)
         receipt["claimedCount"] = len(receipt["claimedIds"])
+
+    # ⑤ 领后再次拉取可领清单：仍 is_claimable 的 = auto-bind 未覆盖（多为活动营销券，
+    #    官方未提供「按券领取」接口），这些券无法由本助手代领，必须用户去 App 手动领。
+    #    把这部分显式报出来，避免「接口成功但卡包没动、claimedCount=0」看起来像没问题。
+    try:
+        avail2 = client.available_coupons()
+        d2 = avail2.get("data") if isinstance(avail2, dict) else avail2
+        items2 = d2 if isinstance(d2, list) else (d2 or {}).get("list", []) if isinstance(d2, dict) else []
+        receipt["manualRequired"] = [
+            {"name": c.get("couponName") or c.get("name") or c.get("title"),
+             "status": c.get("couponStatus") or "", "label": c.get("label") or "",
+             "image": c.get("couponImage") or c.get("image") or c.get("pic") or ""}
+            for c in items2 if is_claimable(c)
+        ]
+    except Exception as e:
+        receipt["errors"].append(f"available-coupons(after): {e}")
+        receipt["manualRequired"] = None
 
     return receipt

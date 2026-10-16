@@ -183,7 +183,7 @@ def capabilities() -> dict:
              "cli": "delivery"},
             {"code": "G", "name": "定时与确认", "desc": "草稿确认闸三层拦截，未经用户确认绝不执行花钱动作",
              "cli": "order"},
-            {"code": "H", "name": "省钱账单", "desc": "仅汇总 query-order.totalDiscountAmount 已核实的订单优惠；盯价估算和待核实订单单独展示",
+            {"code": "H", "name": "省钱账单", "desc": "仅汇总 query-order.totalDiscountAmount 且订单已支付/已完成的优惠；待核实、取消和退款订单排除",
              "cli": "report"},
             {"code": "I", "name": "优惠方案分享", "desc": "下单前预计优惠图片 + 不含凭据的 order recipe（二维码复现）",
              "cli": "share"},

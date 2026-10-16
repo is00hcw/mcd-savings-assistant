@@ -111,8 +111,8 @@ CLI 的一切输出都是**结构化 payload**，带 `type` 字段：
 | `report` | 省钱账单（细看/存档） | HTML 页面 | 生成 HTML 后用文件卡片呈现，引导"打开细看" |
 | `share` | 下单前优惠方案与复现配方 | 图片 | 生成图片后用图片卡片呈现，并附复现提示词；不得表述为实际省钱战报 |
 
-**产出 payload 的命令**（`patrol` / `best` / `coupons` / `report` / `share` / `doctor` /
-`capabilities` / `render`）支持 `--format`：
+**产出 payload 的命令**（`patrol` / `best` / `coupons` / `report` / `share` /
+`render`）支持 `--format`：
 
 ```bash
 --format inline   # 内联卡片（Markdown 兜底，任何宿主都能渲染；默认）
@@ -127,6 +127,8 @@ CLI 的一切输出都是**结构化 payload**，带 `type` 字段：
 
 过程型命令（`schedule` / `order` / `meals` / `stores` / `warmup` / `raw`）不产 payload，
 输出文本进度或原始 JSON，**没有** `--format` 参数。
+
+`doctor` / `capabilities` 同样不产 payload，只支持 `--format text|json`，不接受 HTML/SVG。
 
 **你必须自己按 `type` 选渲染方式**，不要把所有输出都当纯文本念给用户：
 

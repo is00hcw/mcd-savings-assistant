@@ -286,6 +286,116 @@ def _best_quote(client, store_code: str, items: list[dict],
     return draft
 
 
+_DISPLAY_ONLY_ITEM_FIELDS = ("unitPrice", "subtotal", "originalSubtotal", "officialName")
+_LINE_IDENTITY_FIELDS = (
+    "id", "lineId", "itemId", "skuId", "skuCode", "specId", "specCode",
+    "spec", "specification", "specName", "roundList", "rounds",
+    "modification", "modifications", "options", "optionList",
+    "replaceList", "replacementList", "subItems", "setMealItems",
+)
+
+
+def _quantity_key(value, default: bool = False) -> str:
+    if value in (None, ""):
+        return "1" if default else ""
+    try:
+        number = float(value)
+        if number.is_integer():
+            return str(int(number))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return str(value)
+
+
+def _line_group_key(item: dict, input_row: bool = False) -> tuple[str, str]:
+    return (str(item.get("productCode") or ""),
+            _quantity_key(item.get("quantity"), default=input_row))
+
+
+def _identity_value(value):
+    if value in (None, "", [], {}):
+        return None
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), default=str)
+
+
+def _line_identity(item: dict) -> dict[str, str] | None:
+    identity = {}
+    for field in _LINE_IDENTITY_FIELDS:
+        if field not in item:
+            continue
+        value = _identity_value(item.get(field))
+        if value is not None:
+            identity[field] = value
+    return identity or None
+
+
+def _identities_compatible(left: dict[str, str] | None,
+                           right: dict[str, str] | None) -> bool:
+    if not left or not right:
+        return False
+    common = set(left) & set(right)
+    return bool(common) and all(left[field] == right[field] for field in common)
+
+
+def _match_product_rows(items: list[dict], rows: list[dict]) -> list[dict | None]:
+    """按商品码/数量及可验证规格身份匹配服务端行，拒绝顺序猜测。"""
+    matches: list[dict | None] = [None] * len(items)
+    item_groups: dict[tuple[str, str], list[int]] = {}
+    row_groups: dict[tuple[str, str], list[int]] = {}
+    rows_by_code: dict[str, list[int]] = {}
+
+    for index, item in enumerate(items):
+        item_groups.setdefault(_line_group_key(item, input_row=True), []).append(index)
+    for index, row in enumerate(rows):
+        code = str(row.get("productCode") or "")
+        if not code:
+            continue
+        row_groups.setdefault(_line_group_key(row), []).append(index)
+        rows_by_code.setdefault(code, []).append(index)
+
+    for group, item_indexes in item_groups.items():
+        candidate_indexes = row_groups.get(group, [])
+        if not candidate_indexes:
+            code = group[0]
+            code_rows = rows_by_code.get(code, [])
+            if (len(item_indexes) == 1 and len(code_rows) == 1 and
+                    _quantity_key(rows[code_rows[0]].get("quantity")) == ""):
+                candidate_indexes = code_rows
+            else:
+                continue
+        if len(candidate_indexes) != len(item_indexes):
+            continue
+
+        if len(item_indexes) == 1:
+            item_identity = _line_identity(items[item_indexes[0]])
+            row_identity = _line_identity(rows[candidate_indexes[0]])
+            if item_identity and row_identity and not _identities_compatible(
+                    item_identity, row_identity):
+                continue
+            matches[item_indexes[0]] = rows[candidate_indexes[0]]
+            continue
+
+        # Duplicate code + quantity requires a unique two-sided identity match.
+        candidates_by_item = {}
+        for item_index in item_indexes:
+            item_identity = _line_identity(items[item_index])
+            if not item_identity:
+                candidates_by_item[item_index] = []
+                continue
+            candidates_by_item[item_index] = [
+                row_index for row_index in candidate_indexes
+                if _identities_compatible(item_identity, _line_identity(rows[row_index]))
+            ]
+        if (any(len(candidates) != 1 for candidates in candidates_by_item.values()) or
+                len({candidates[0] for candidates in candidates_by_item.values()}) !=
+                len(item_indexes)):
+            continue
+        for item_index, candidates in candidates_by_item.items():
+            matches[item_index] = rows[candidates[0]]
+    return matches
+
+
 def _attach_product_breakdown(draft: dict, calc_result: dict):
     """把 calculate-price 的 productList（单价/小计）回填进草稿商品行。
 
@@ -297,52 +407,18 @@ def _attach_product_breakdown(draft: dict, calc_result: dict):
     plist = d.get("productList") or []
     items = draft.get("items", [])
 
-    def quantity_key(value):
-        if value in (None, ""):
-            return ""
-        try:
-            return str(int(value))
-        except (TypeError, ValueError):
-            return str(value)
+    for item in items:
+        for field in _DISPLAY_ONLY_ITEM_FIELDS:
+            item.pop(field, None)
 
-    item_counts = {}
-    item_counts_by_code = {}
-    for it in items:
-        code = str(it.get("productCode") or "")
-        key = (code, quantity_key(it.get("quantity") or 1))
-        item_counts[key] = item_counts.get(key, 0) + 1
-        item_counts_by_code[code] = item_counts_by_code.get(code, 0) + 1
-
-    by_code = {}
-    by_code_and_quantity = {}
-    product_counts = {}
-    for p in plist:
-        code = str(p.get("productCode") or "")
-        if code:
-            by_code.setdefault(code, []).append(p)
-            quantity = quantity_key(p.get("quantity"))
-            if quantity:
-                key = (code, quantity)
-                by_code_and_quantity.setdefault(key, []).append(p)
-                product_counts[key] = product_counts.get(key, 0) + 1
-
-    for it in items:
-        code = str(it.get("productCode") or "")
-        key = (code, quantity_key(it.get("quantity") or 1))
-        candidates = by_code_and_quantity.get(key, [])
-        if candidates and item_counts[key] == product_counts[key]:
-            p = candidates.pop(0)
-        else:
-            # Without quantity, only a single input row and response row are unambiguous.
-            rows = by_code.get(code, [])
-            if (item_counts_by_code.get(code) == 1 and len(rows) == 1
-                    and quantity_key(rows[0].get("quantity")) == ""):
-                p = rows[0]
-            else:
-                continue
+    matches = _match_product_rows(items, plist)
+    for it, p in zip(items, matches):
         if not p:
             continue
-        qty = int(p.get("quantity") or it.get("quantity") or 1)
+        try:
+            qty = int(float(p.get("quantity") or it.get("quantity") or 1))
+        except (TypeError, ValueError, OverflowError):
+            qty = 1
         sub = p.get("subtotal")
         orig_sub = p.get("originalSubtotal")
         it["unitPrice"] = _fen2yuan(sub) / qty if sub not in (None, "") else None
@@ -362,14 +438,20 @@ def _attach_product_breakdown(draft: dict, calc_result: dict):
 
 def _price_of(calc_result: dict) -> float:
     """从算价结果提取可识别金额（分）。找不到有效金额直接抛错，而非返回 inf。"""
+    return float(_price_value(calc_result))
+
+
+def _price_value(calc_result: dict):
+    """提取草稿和比较阶段共用的原始金额字段（单位：分）。"""
     d = calc_result.get("data") if isinstance(calc_result, dict) else calc_result
     if not isinstance(d, dict):
         raise ValueError("算价结果无 data 字段，无法提取金额")
     for key in ("price", "payPrice", "realTotalAmount"):
         try:
-            v = float(d.get(key))
+            raw = d.get(key)
+            v = float(raw)
             if v > 0:
-                return v
+                return raw
         except (TypeError, ValueError):
             continue
     raise ValueError("算价结果缺少可识别的金额字段（price/payPrice/realTotalAmount）")
@@ -394,7 +476,7 @@ def _make_draft(store_code: str, items: list[dict], best: dict,
                 take_way: dict | None, track: str, delivery: dict | None = None) -> dict:
     d = best["result"].get("data") if isinstance(best["result"], dict) else best["result"]
     d = d if isinstance(d, dict) else {}
-    price = d.get("price")
+    price = _price_value(best["result"])
     orig = d.get("originalPrice")
     discount = d.get("discount")
     coupon = best["coupon"] or {}
@@ -462,20 +544,16 @@ def _mirror_item_display_fields(fresh: dict, original: dict) -> None:
     原草稿有就照抄，绝不参与 diff。商品规格（roundList / modification / 替换项 等）
     不在此列，任何变化都必须如实呈现。
     """
-    def key(it: dict) -> tuple:
-        return (str(it.get("productCode") or ""), str(it.get("quantity") or ""))
-
-    display_only = ("unitPrice", "subtotal", "originalSubtotal", "officialName")
-    old_by_key: dict[tuple, list[dict]] = {}
-    for it in original.get("items") or []:
-        old_by_key.setdefault(key(it), []).append(it)
-
-    for it in fresh.get("items") or []:
-        bucket = old_by_key.get(key(it))
-        if not bucket:
-            continue  # 新增/换商品：交给 diff 如实呈现
-        old_item = bucket.pop(0)
-        for f in display_only:
+    fresh_items = fresh.get("items") or []
+    old_items = original.get("items") or []
+    matches = _match_product_rows(fresh_items, old_items)
+    for it, old_item in zip(fresh_items, matches):
+        if old_item is None:
+            # 同码同量且没有可信身份时，不能把旧展示金额按顺序套到新行。
+            for field in _DISPLAY_ONLY_ITEM_FIELDS:
+                it.pop(field, None)
+            continue
+        for f in _DISPLAY_ONLY_ITEM_FIELDS:
             if f in old_item:
                 it[f] = old_item[f]
             else:

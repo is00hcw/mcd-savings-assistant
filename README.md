@@ -44,7 +44,7 @@
 `share` 当前从待下单草稿生成，卡片会标明「预计优惠」，不会计入已核实账单。
 
 **产出 payload 的命令**支持 `--format inline|json|html|svg`（`patrol` / `best` / `coupons` /
-`report` / `share` / `doctor` / `capabilities` / `render`），例如：
+`report` / `share` / `render`），例如：
 
 ```bash
 python main.py patrol  --format inline           # 内联卡片（默认，任何宿主可渲染）
@@ -60,6 +60,9 @@ python main.py render  --payload pay.json --format html   # 渲染层可插拔�
 
 过程型命令（`schedule` / `order` / `meals` / `stores` / `warmup` / `raw`）不产 payload，
 输出文本进度或原始 JSON，**没有** `--format` 参数。
+
+`doctor` / `capabilities` 是过程型自检与说明命令，不产 payload，只支持
+`--format text|json`；它们不接受 HTML/SVG。
 
 设计原则：**图片只用于分享、不用于交互**——确认闸永远是卡片/按钮，绝不靠图片。
 
@@ -314,8 +317,9 @@ Top3 里挑最优）单轨直出；`--track dual` 双轨候选二选一——两
 需分别显式加 `--include-config` / `--include-generated`，并输入精确确认语句。未登记的缓存目录文件会保留。
 `data status` 会单独列出未登记文件；这些文件不会被本工具导出或删除。
 
-账单口径：只有通过 `query-order.totalDiscountAmount` 核实的订单优惠计入「实际省下」；
-下单前报价与盯价发现的降价分列为预计/潜在优惠。历史旧账本记录无法确认数据来源，会列为「优惠待核实」，不回填到实际金额。
+账单口径：只有通过 `query-order.totalDiscountAmount` 且订单明确已支付/已完成的优惠计入「实际省下」；
+待支付、状态未知、取消或退款订单不计入。下单前报价与盯价发现的降价分列为预计/潜在优惠。
+历史旧账本记录无法确认数据来源，会列为「优惠待核实」，不回填到实际金额。
 
 ## 个人信息不用手填：自动推导
 

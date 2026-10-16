@@ -305,6 +305,80 @@ def _find_order_discount(value) -> float | None:
     return None
 
 
+_REALIZED_STATUS_HINTS = (
+    "已支付", "支付成功", "已完成", "订单完成", "已核销", "已消费",
+    "payment_success", "payment-success",
+)
+_REALIZED_STATUS_KEYS = {
+    "orderstatus", "orderstate", "paymentstatus", "paymentstate",
+    "paystatus", "paystate", "statusname", "statustext", "state",
+}
+_INVALIDATED_STATUS_HINTS = (
+    "已取消", "订单取消", "已退款", "退款中", "已关闭", "已失效",
+)
+_INVALIDATED_STATUS_PREFIXES = (
+    "cancelled", "canceled", "refunded", "refund_pending", "refund-pending",
+    "closed", "void",
+)
+
+
+def _is_status_key(key) -> bool:
+    normalized = str(key or "").replace("_", "").replace("-", "").lower()
+    return (normalized in _REALIZED_STATUS_KEYS or
+            normalized.endswith("status") or normalized.endswith("state"))
+
+
+def _is_realized_status(value, key=None) -> bool:
+    """只接受明确的支付/完成状态，未知状态保持待核实。"""
+    if isinstance(value, bool):
+        return bool(value) if str(key or "").replace("_", "").lower() in {
+            "paymentstatus", "paystatus"
+        } else False
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        normalized = str(key or "").replace("_", "").lower()
+        return normalized in {"paymentstatus", "paystatus", "paymentstate", "paystate"} and value == 1
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    if any(marker in text for marker in _REALIZED_STATUS_HINTS):
+        return True
+    if text in {"paid", "completed", "complete", "finished", "redeemed", "consumed"}:
+        return True
+    normalized = str(key or "").replace("_", "").replace("-", "").lower()
+    return (normalized in {"paymentstatus", "paystatus", "paymentstate", "paystate"}
+            and text in {"success", "succeeded", "ok", "1"})
+
+
+def _has_invalidated_order_status(value) -> bool:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if _is_status_key(key):
+                text = str(child or "").strip().lower()
+                if (any(marker in text for marker in _INVALIDATED_STATUS_HINTS) or
+                        any(text.startswith(prefix) for prefix in _INVALIDATED_STATUS_PREFIXES)):
+                    return True
+            if _has_invalidated_order_status(child):
+                return True
+    elif isinstance(value, list):
+        return any(_has_invalidated_order_status(child) for child in value)
+    return False
+
+
+def _has_realized_order_status(value) -> bool:
+    """递归兼容 query-order 常见状态字段；没有明确状态时返回 False。"""
+    if _has_invalidated_order_status(value):
+        return False
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if _is_status_key(key) and _is_realized_status(child, key):
+                return True
+            if _has_realized_order_status(child):
+                return True
+    elif isinstance(value, list):
+        return any(_has_realized_order_status(child) for child in value)
+    return False
+
+
 def execute_draft(client, draft: dict) -> dict:
     """执行下单（前提：已过 human_gate）。返回回执并落盘审计日志。
 
@@ -350,15 +424,21 @@ def execute_draft(client, draft: dict) -> dict:
     }
     order_id = _find_order_id(result)
     actual_discount = None
+    realized_status = False
     if order_id:
         try:
-            actual_discount = _find_order_discount(client.query_order(order_id))
+            detail = client.query_order(order_id)
+            realized_status = _has_realized_order_status(detail)
+            if realized_status:
+                actual_discount = _find_order_discount(detail)
         except Exception:
             actual_discount = None
+            realized_status = False
     receipt["savingsVerification"] = {
         "verified": actual_discount is not None,
         "source": "query-order.totalDiscountAmount" if actual_discount is not None else None,
         "amount": actual_discount,
+        "orderStatusVerified": realized_status,
         "ledgerRecorded": False,
     }
     # A quoted draft discount is not an actual saving; only the order detail can verify it.

@@ -281,7 +281,7 @@ def test_order_savings_verification(tmp):
 
         def query_order(self, order_id):
             assert order_id == "order-1"
-            return {"data": {"totalDiscountAmount": "2.75"}}
+            return {"data": {"totalDiscountAmount": "2.75", "orderStatus": "已完成"}}
 
     draft = {
         "storeCode": "S1", "takeWayCode": "T1", "items": [{"name": "套餐", "quantity": 1}],
@@ -310,6 +310,87 @@ def test_order_savings_verification(tmp):
     finally:
         ledger.LEDGER_FILE = old_ledger
         order_exec.RECEIPT_LOG = old_receipts
+
+
+def test_order_savings_requires_realized_status(tmp):
+    """订单详情有优惠金额但未明确支付/完成时，不得计入实际省下。"""
+    from src import ledger
+
+    old_ledger, old_receipts = ledger.LEDGER_FILE, order_exec.RECEIPT_LOG
+    ledger.LEDGER_FILE = tmp / "realized-status-ledger.jsonl"
+    order_exec.RECEIPT_LOG = tmp / "realized-status-receipts.jsonl"
+
+    class Client:
+        def __init__(self, status=None, order_id="order-status"):
+            self.status = status
+            self.order_id = order_id
+
+        def order_list(self):
+            return {"data": {"list": []}}
+
+        def call(self, name, arguments=None, confirm=False):
+            assert name == "create-order" and confirm is True
+            return {"data": {"orderId": self.order_id}}
+
+        def query_order(self, order_id):
+            detail = {"totalDiscountAmount": "2.75"}
+            if self.status is not None:
+                detail["orderStatus"] = self.status
+            return {"data": detail}
+
+    draft = {
+        "storeCode": "S1", "takeWayCode": "T1", "items": [{"name": "套餐", "quantity": 1}],
+        "originalPrice": 10, "price": 5, "discount": 5,
+        "confirmedByHuman": True, "confirmedAt": "2026-10-14 12:00:00",
+        "confirmedText": order_exec.CONFIRM_TEXT,
+    }
+    try:
+        pending = order_exec.execute_draft(Client("待支付", "order-pending"), draft)
+        assert pending["savingsVerification"]["verified"] is False
+        assert ledger.aggregate("all")["saved"] == 0
+
+        completed = order_exec.execute_draft(Client("已完成", "order-completed"), draft)
+        assert completed["savingsVerification"]["verified"] is True
+        assert ledger.aggregate("all")["saved"] == 2.75
+
+        missing = order_exec.execute_draft(Client(None, "order-missing-status"), draft)
+        assert missing["savingsVerification"]["verified"] is False
+        assert ledger.aggregate("all")["saved"] == 2.75
+        assert ledger.aggregate("all")["unverifiedOrders"] == 2
+
+        refunded = order_exec.execute_draft(Client("已退款", "order-refunded"), draft)
+        assert refunded["savingsVerification"]["verified"] is False
+        assert ledger.aggregate("all")["saved"] == 2.75
+        assert ledger.aggregate("all")["unverifiedOrders"] == 3
+    finally:
+        ledger.LEDGER_FILE = old_ledger
+        order_exec.RECEIPT_LOG = old_receipts
+
+
+def test_cancel_invalidates_verified_order(tmp):
+    """已核实订单取消后，实际省下聚合必须排除该订单。"""
+    from src import cancel, ledger
+
+    old_ledger = ledger.LEDGER_FILE
+    ledger.LEDGER_FILE = tmp / "cancelled-order-ledger.jsonl"
+    ledger.append_event(
+        "order", orderId="order-cancelled", storeCode="S1", name="套餐",
+        saved=2.75, savingsVerified=True, savingsSource=ledger.SAVINGS_SOURCE,
+    )
+
+    class Client:
+        def call(self, name, arguments=None, confirm=False):
+            assert name == "cancel-order" and confirm is True
+            return {"ok": True}
+
+    try:
+        receipt = cancel.cancel_orders(Client(), [{"orderId": "order-cancelled"}])
+        assert len(receipt["cancelled"]) == 1
+        agg = ledger.aggregate("all")
+        assert agg["saved"] == 0
+        assert all(e.get("kind") != "order" for e in agg["events"])
+    finally:
+        ledger.LEDGER_FILE = old_ledger
 
 
 def test_local_data_management(tmp):
@@ -883,6 +964,19 @@ def test_price_failures_raise():
         def store_coupons(self, s, **kw): return {"data": {"coupons": [{"id": "1"}]}}
     coupons, warnings = optimize._coupon_candidates(Bad(), "S")
     assert len(coupons) == 1 and any("失败" in w for w in warnings)
+
+
+def test_make_draft_uses_fallback_amount_fields():
+    """算价响应只有 payPrice/realTotalAmount 时，草稿仍应使用正确到手价。"""
+    from src import optimize
+
+    for field in ("payPrice", "realTotalAmount"):
+        draft = optimize._make_draft(
+            "S", [], {"coupon": None,
+                       "result": {"data": {field: 100,
+                                            "takeWayList": [{"code": "T1"}]}}},
+            {"code": "T1"}, "global")
+        assert draft["price"] == 1.0, field
 
 
 def test_schedule_concurrency():
@@ -1823,9 +1917,11 @@ def test_product_breakdown_keeps_duplicate_product_lines_distinct():
     }
     same_quantity_result = {"data": {"productList": [
         {"productCode": "4810", "quantity": 1, "subtotal": 100,
-         "originalSubtotal": 100, "productName": "原味薯条"},
+         "originalSubtotal": 100, "productName": "原味薯条",
+         "roundList": [{"id": "r1"}]},
         {"productCode": "4810", "quantity": 1, "subtotal": 120,
-         "originalSubtotal": 120, "productName": "辣味薯条"},
+         "originalSubtotal": 120, "productName": "辣味薯条",
+         "roundList": [{"id": "r2"}]},
     ]}}
 
     optimize._attach_product_breakdown(same_quantity, same_quantity_result)
@@ -1855,6 +1951,190 @@ def test_product_breakdown_skips_aggregate_for_duplicate_product_lines():
 
     assert all("subtotal" not in item and "unitPrice" not in item
                for item in draft["items"])
+
+
+def test_product_breakdown_matches_specs_and_skips_ambiguous_rows():
+    """服务端重排同码同量商品时按规格匹配；没有身份时宁可不回填。"""
+    from src import optimize
+
+    reordered = {
+        "storeName": "测试店",
+        "items": [
+            {"productCode": "4810", "name": "薯条", "quantity": 1,
+             "roundList": [{"id": "r1"}]},
+            {"productCode": "4810", "name": "薯条", "quantity": 1,
+             "roundList": [{"id": "r2"}]},
+        ],
+    }
+    result = {"data": {"productList": [
+        {"productCode": "4810", "quantity": 1,
+         "roundList": [{"id": "r2"}], "subtotal": 120,
+         "originalSubtotal": 120, "productName": "辣味薯条"},
+        {"productCode": "4810", "quantity": 1,
+         "roundList": [{"id": "r1"}], "subtotal": 100,
+         "originalSubtotal": 100, "productName": "原味薯条"},
+    ]}}
+    optimize._attach_product_breakdown(reordered, result)
+    assert [item["subtotal"] for item in reordered["items"]] == [1.0, 1.2]
+    assert [item["officialName"] for item in reordered["items"]] == ["原味薯条", "辣味薯条"]
+
+    ambiguous = {
+        "items": [
+            {"productCode": "4810", "name": "薯条", "quantity": 1},
+            {"productCode": "4810", "name": "薯条", "quantity": 1},
+        ],
+    }
+    ambiguous_result = {"data": {"productList": [
+        {"productCode": "4810", "quantity": 1, "subtotal": 100},
+        {"productCode": "4810", "quantity": 1, "subtotal": 120},
+    ]}}
+    optimize._attach_product_breakdown(ambiguous, ambiguous_result)
+    assert all("subtotal" not in item and "unitPrice" not in item
+               for item in ambiguous["items"])
+
+    original = {"items": [
+        {"productCode": "4810", "quantity": 1, "roundList": [{"id": "r1"}],
+         "subtotal": 1.0, "officialName": "原味薯条"},
+        {"productCode": "4810", "quantity": 1, "roundList": [{"id": "r2"}],
+         "subtotal": 1.2, "officialName": "辣味薯条"},
+    ]}
+    fresh = {"items": [
+        {"productCode": "4810", "quantity": 1, "roundList": [{"id": "r2"}]},
+        {"productCode": "4810", "quantity": 1, "roundList": [{"id": "r1"}]},
+    ]}
+    optimize._mirror_item_display_fields(fresh, original)
+    assert [item["subtotal"] for item in fresh["items"]] == [1.2, 1.0]
+    assert [item["officialName"] for item in fresh["items"]] == ["辣味薯条", "原味薯条"]
+
+    ambiguous_original = {"items": [
+        {"productCode": "4810", "quantity": 1, "subtotal": 1.0},
+        {"productCode": "4810", "quantity": 1, "subtotal": 1.2},
+    ]}
+    ambiguous_fresh = {"items": [
+        {"productCode": "4810", "quantity": 1},
+        {"productCode": "4810", "quantity": 1},
+    ]}
+    optimize._mirror_item_display_fields(ambiguous_fresh, ambiguous_original)
+    assert all("subtotal" not in item for item in ambiguous_fresh["items"])
+
+
+def test_price_events_are_deduplicated():
+    """同一次降价的 dropped/new_low 事件只展示一次并只计算一次节省。"""
+    from src import payloads
+
+    events = [
+        {"type": "dropped", "name": "雪糕", "storeCode": "S1",
+         "prev": 5, "currentPrice": 3},
+        {"type": "new_low", "name": "雪糕", "storeCode": "S1",
+         "prevMin": 5, "currentPrice": 3},
+    ]
+    p = payloads.alert_price_drop(events, scanned=1)
+    assert next(m["value"] for m in p["metrics"] if m["label"] == "抓到降价") == 1
+    assert next(m["value"] for m in p["metrics"] if m["label"] == "按历史最低省") == 2
+    assert len(p["items"]) == 1
+
+    dropped_only = payloads.alert_price_drop([
+        {"type": "dropped", "name": "雪糕", "storeCode": "S1",
+         "prev": 5, "current": 3},
+    ], scanned=1)
+    assert next(m["value"] for m in dropped_only["metrics"] if m["label"] == "按历史最低省") == 2
+
+
+def test_patrol_deduplicates_snapshot_and_baseline_events(tmp):
+    """巡检的两条降价检测路径命中同一商品时，账本也只能写一条。"""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from src import ledger, perceive, price_memory
+
+    old_values = {
+        "baseline": price_memory.BASELINE_FILE,
+        "snapshot": price_memory.SNAPSHOT_DIR,
+        "profile": price_memory.PROFILE_FILE,
+        "stores": price_memory.STORE_NAMES_FILE,
+        "ledger": ledger.LEDGER_FILE,
+    }
+    price_memory.BASELINE_FILE = tmp / "patrol-baseline.json"
+    price_memory.SNAPSHOT_DIR = tmp / "snapshots"
+    price_memory.PROFILE_FILE = tmp / "patrol-profile.json"
+    price_memory.STORE_NAMES_FILE = tmp / "patrol-stores.json"
+    ledger.LEDGER_FILE = tmp / "patrol-ledger.jsonl"
+    price_memory.save_snapshot("S1", {
+        "雪糕": {"name": "雪糕", "code": "P1", "currentPrice": 5, "originalPrice": 8},
+    })
+    price_memory.BASELINE_FILE.write_text(json.dumps({
+        "雪糕": {"minCurrentPrice": 5, "originalPrice": 8},
+    }), encoding="utf-8")
+
+    class Client:
+        def my_account(self):
+            return {"data": {}}
+
+        def available_coupons(self):
+            return {"data": []}
+
+        def call(self, name, arguments=None, confirm=False):
+            assert name == "campaign-calendar"
+            return {"data": {}}
+
+        def meals(self, store_code):
+            return {"data": {"meals": {
+                "P1": {"name": "雪糕", "currentPrice": 3, "originalPrice": 8},
+            }}}
+
+    cfg = SimpleNamespace(favorite_stores=["S1"], scan_store_limit=3,
+                          expire_points_threshold=100, new_low_ratio=1.0)
+    try:
+        with patch.object(perceive, "get_config", return_value=cfg):
+            report = perceive.scan_stores(Client())
+        assert len(report["priceEvents"]) == 1
+        assert report["priceEvents"][0]["type"] == "new_low"
+        events = ledger.load_events()
+        assert len(events) == 1 and events[0]["kind"] == "drop"
+        assert events[0]["source"] == "new_low"
+    finally:
+        price_memory.BASELINE_FILE = old_values["baseline"]
+        price_memory.SNAPSHOT_DIR = old_values["snapshot"]
+        price_memory.PROFILE_FILE = old_values["profile"]
+        price_memory.STORE_NAMES_FILE = old_values["stores"]
+        ledger.LEDGER_FILE = old_values["ledger"]
+
+
+def test_patrol_outputs_unique_artifacts_and_rejects_unsupported_formats(tmp):
+    """巡检多张 HTML 卡不能互相覆盖，doctor/capabilities 只接受 text/json。"""
+    import subprocess
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import main
+
+    root = Path(__file__).resolve().parent.parent
+    for command in ("doctor", "capabilities"):
+        result = subprocess.run(
+            [sys.executable, "main.py", command, "--format", "html"],
+            cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        assert result.returncode == 2, command
+        assert "invalid choice" in result.stderr, command
+
+    report = {
+        "priceEvents": [{"type": "new_low", "name": "雪糕", "storeCode": "S1",
+                         "prevMin": 5, "currentPrice": 3}],
+        "scannedStores": [{"storeCode": "S1"}],
+        "expirePoints": {"currentMonth": 100, "nextMonth": 0, "available": 100},
+        "newCouponsAvailable": [],
+    }
+    args = SimpleNamespace(stores=[], format="html", out=str(tmp / "patrol.html"),
+                           no_coupon_hint=False)
+    cfg = SimpleNamespace(nickname="测试用户", token="unused")
+    with patch.object(main, "_client", return_value=object()), \
+            patch.object(main, "get_config", return_value=cfg), \
+            patch.object(main.perceive, "scan_stores", return_value=report):
+        main.cmd_patrol(args)
+
+    first = tmp / "patrol-1.html"
+    second = tmp / "patrol-2.html"
+    assert first.exists() and second.exists()
+    assert first.read_text(encoding="utf-8") != second.read_text(encoding="utf-8")
+    assert not (tmp / "patrol.html").exists()
 
 
 def test_optimize_specified_coupon():
@@ -1953,6 +2233,55 @@ def test_auto_claim_unknown_when_query_fails():
             return {"data": {"coupons": [{"id": i} for i in self.wallet]}}
     r2 = coupons.auto_claim(FailAfter())
     assert r2["claimedCount"] is None
+
+
+def test_auto_claim_manual_required():
+    """auto-bind 未覆盖的券（活动营销券）必须显式标为「待手动领取」。
+
+    官方 MCP 仅暴露 auto-bind-coupons（一键、无券号），不提供按券领取接口，
+    因此部分营销券 auto-bind 后仍在 available 列表且仍 claimable —— 这类券本助手
+    无法代领，必须在回执里明确提示用户去 App 手动领，避免 claimedCount=0 看起来「没问题」。
+    """
+    from src import coupons, payloads
+
+    class Fake:
+        def __init__(self):
+            self.wallet = ["c1"]
+            self.claimed = set()
+        def my_coupons(self):
+            return {"data": {"coupons": [{"id": i} for i in self.wallet]}}
+        def available_coupons(self):
+            all_c = [
+                {"couponName": "券A", "couponStatus": "", "label": "", "couponImage": ""},
+                {"couponName": "券B-营销", "couponStatus": "", "label": "",
+                 "couponImage": "https://img.mcd.cn/x/bbb.png"},
+            ]
+            return {"data": [c for c in all_c if c["couponName"] not in self.claimed]}
+        def call(self, name, args=None, confirm=False):
+            if name == "auto-bind-coupons":
+                self.wallet.append("c2")     # 只领到券A
+                self.claimed.add("券A")
+                return {"ok": True}
+            raise AssertionError(name)
+
+    r = coupons.auto_claim(Fake())
+    assert r["claimedCount"] == 1
+    assert isinstance(r["manualRequired"], list)
+    names = [c["name"] for c in r["manualRequired"]]
+    assert "券B-营销" in names
+    assert "券A" not in names     # 已被 auto-bind 领走，不应再提示手动
+    # 活动 banner 图必须一并带回（用户可据此去 App 领）
+    assert r["manualRequired"][0]["image"] == "https://img.mcd.cn/x/bbb.png"
+    p = payloads.alert_coupon_receipt(r, "老大")
+    assert "待手动领取" in [m["label"] for m in p["metrics"]]
+    assert any("手动" in (it.get("note") or "") for it in p["items"])
+    # 回执 payload 必须带 images，且 inline 渲染出图片链接
+    assert any(i.get("url") == "https://img.mcd.cn/x/bbb.png" for i in p["images"])
+    from src import present
+    inline = present.render_inline(p)
+    assert "![券B-营销](https://img.mcd.cn/x/bbb.png)" in inline
+    html = present.render_html(p)
+    assert "https://img.mcd.cn/x/bbb.png" in html and "<img" in html
 
 
 def test_resolve_delivery_status_and_pair():
@@ -2286,6 +2615,8 @@ def main():
         test_present_layers()
         test_ledger(tmp)
         test_order_savings_verification(tmp)
+        test_order_savings_requires_realized_status(tmp)
+        test_cancel_invalidates_verified_order(tmp)
         test_local_data_management(tmp)
         test_local_data_delete_requires_confirmation()
         test_address_derive()
@@ -2299,6 +2630,7 @@ def main():
         test_confirm_format_edge()
         test_confirm_gate_hardening()
         test_price_failures_raise()
+        test_make_draft_uses_fallback_amount_fields()
         test_schedule_concurrency()
         test_is_claimable()
         test_auto_claim_diff()
@@ -2323,6 +2655,10 @@ def main():
         test_reprice_display_only_fields_do_not_break_diff()
         test_product_breakdown_keeps_duplicate_product_lines_distinct()
         test_product_breakdown_skips_aggregate_for_duplicate_product_lines()
+        test_product_breakdown_matches_specs_and_skips_ambiguous_rows()
+        test_price_events_are_deduplicated()
+        test_patrol_deduplicates_snapshot_and_baseline_events(tmp)
+        test_patrol_outputs_unique_artifacts_and_rejects_unsupported_formats(tmp)
         test_optimize_specified_coupon()
         test_schedule_coupon_passthrough()
         test_auto_claim_unknown_when_query_fails()

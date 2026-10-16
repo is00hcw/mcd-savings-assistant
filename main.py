@@ -71,6 +71,19 @@ def _show(payload: dict, args, out: str = "") -> None:
         print(r["content"])
 
 
+def _patrol_output_path(out: str, payload: dict, fmt: str,
+                        index: int, total: int) -> str:
+    """为巡检多张 HTML/SVG 卡生成稳定且不覆盖的文件名。"""
+    if fmt not in ("html", "svg") or total <= 1:
+        return out or ""
+    if not out:
+        return str(Path("data") / f"{payload['type']}-{fmt}-{index}.{fmt}")
+    path = Path(out)
+    suffix = path.suffix or f".{fmt}"
+    stem = path.stem if path.suffix else path.name
+    return str(path.with_name(f"{stem}-{index}{suffix}"))
+
+
 # ---------------------------------------------------------------------------
 def cmd_schedule(args):
     """G 定时执行：登记 / 查看 / 到点触发（只推送确认消息，不自动下单）。"""
@@ -213,7 +226,7 @@ def cmd_init(args):
 def cmd_doctor(args):
     """首次使用自检（只读）：环境 → 配置 → Token → 地址/门店就绪 → 下一步。"""
     res = onboarding.doctor(check_token=not args.offline)
-    if getattr(args, "format", "inline") == "json":
+    if getattr(args, "format", "text") == "json":
         _print(res)      # json 模式：stdout 只输出一个 JSON 对象（text 已含在 res 里）
     else:
         print(res["text"])
@@ -222,7 +235,7 @@ def cmd_doctor(args):
 
 def cmd_capabilities(args):
     """Agent 自述元信息：我是谁 / 我会什么 / 我绝不做什么。"""
-    if getattr(args, "format", "inline") == "json":
+    if getattr(args, "format", "text") == "json":
         _print(onboarding.capabilities())
     else:
         print(onboarding.capabilities_text())
@@ -314,8 +327,10 @@ def cmd_patrol(args):
     if args.format == "json":
         _print({"payloads": payloads_out, "report": report})
         return
-    for p in payloads_out:
-        _show(p, args)
+    total = len(payloads_out)
+    for index, p in enumerate(payloads_out, 1):
+        _show(p, args, out=_patrol_output_path(
+            getattr(args, "out", ""), p, args.format, index, total))
         print()
 
 
@@ -771,6 +786,10 @@ def main():
                        help="渲染形态：inline 内联卡片(默认) / json 结构化 / html 页面 / svg 图片")
         p.add_argument("--out", default="", help="输出文件路径（html/svg 时生效）")
 
+    def add_text_fmt(p, default="text"):
+        p.add_argument("--format", choices=("text", "json"), default=default,
+                       help="输出形态：text 文本(默认) / json 结构化")
+
     p = sub.add_parser("init", help="生成 config.local.json 模板 + 领 Token 指引")
     p.add_argument("--force", action="store_true", help="覆盖已存在的配置")
     p.set_defaults(fn=cmd_init)
@@ -820,11 +839,11 @@ def main():
 
     p = sub.add_parser("doctor", help="首次使用自检（只读，不下单不领券）")
     p.add_argument("--offline", action="store_true", help="跳过 Token 连通性探测（离线可用）")
-    add_fmt(p)
+    add_text_fmt(p)
     p.set_defaults(fn=cmd_doctor)
 
     p = sub.add_parser("capabilities", help="能力清单与红线（给 Agent 读的自述元信息）")
-    add_fmt(p)
+    add_text_fmt(p)
     p.set_defaults(fn=cmd_capabilities)
 
     p = sub.add_parser("warmup", help="首启热身：导入历史订单 + 推导地址（只读，--apply 才写盘）")

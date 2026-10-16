@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """省钱账本（H 模块数据源）
 
-记录两类事件：
+记录三类事件：
   drop    盯价发现的降价/新低（省 = 历史最低 - 当前价，估算值）
   order   query-order 核实的订单优惠（来自 totalDiscountAmount）
+  order_cancelled  已取消订单的失效标记（排除对应 order 的实际省下）
 
 数据只存本机 ~/.mcd-skill/ledger.jsonl，不收集不上传。
 """
@@ -23,7 +24,7 @@ SAVINGS_SOURCE = "query-order.totalDiscountAmount"
 
 def append_event(kind: str, **fields) -> dict:
     """追加一条账本记录；order 金额必须来自已核实的服务端订单详情。"""
-    if kind not in {"drop", "order"}:
+    if kind not in {"drop", "order", "order_cancelled"}:
         raise ValueError(f"不支持的账本事件类型: {kind}")
     if kind == "order":
         verified = fields.get("savingsVerified") is True
@@ -39,17 +40,38 @@ def append_event(kind: str, **fields) -> dict:
             fields.pop("saved", None)
             fields.pop("actualSaved", None)
             fields["savingsVerified"] = False
-    else:
+    elif kind == "drop":
         amount = _strict_amount(fields.get("saved"))
         if amount is None:
             raise ValueError("降价事件必须包含非负估算优惠金额")
         fields.pop("saved", None)
         fields["potential"] = amount
+    else:
+        order_id = str(fields.get("orderId") or "").strip()
+        if not order_id:
+            raise ValueError("订单失效事件必须包含 orderId")
+        fields["orderId"] = order_id
+        fields["savingsStatus"] = "cancelled"
     rec = {"kind": kind, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), **fields}
     LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(LEDGER_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return rec
+
+
+def record_cancellation(order_id: str) -> dict | None:
+    """为本地已有订单账本写入取消标记；没有对应记录时不创建空账本。"""
+    order_id = str(order_id or "").strip()
+    if not order_id or not LEDGER_FILE.exists():
+        return None
+    events = load_events()
+    if not any(e.get("kind") == "order" and str(e.get("orderId") or "") == order_id
+               for e in events):
+        return None
+    if any(e.get("kind") == "order_cancelled"
+           and str(e.get("orderId") or "") == order_id for e in events):
+        return None
+    return append_event("order_cancelled", orderId=order_id)
 
 
 def load_events() -> list[dict]:
@@ -94,6 +116,10 @@ def aggregate(period: str = "month", now: datetime | None = None) -> dict:
     period = period if period in {"today", "week", "month", "all"} else "month"
     since = _since(period, now or datetime.now())
     evs = load_events()
+    cancelled_ids = {
+        str(e.get("orderId") or "") for e in evs
+        if e.get("kind") == "order_cancelled" and e.get("orderId")
+    }
 
     saved, potential, drops, orders, unverified_orders = 0.0, 0.0, 0, 0, 0
     by_store: dict[str, float] = {}
@@ -115,7 +141,16 @@ def aggregate(period: str = "month", now: datetime | None = None) -> dict:
             public_event["savingsStatus"] = "potential"
             report_events.append(public_event)
             continue          # drop 是估算，只进「潜在优惠」，不进真实省下/门店/商品榜
+        if kind == "order_cancelled":
+            if e.get("orderId"):
+                public_event = dict(e)
+                public_event["savingsStatus"] = "cancelled"
+                report_events.append(public_event)
+            continue
         if kind != "order":
+            continue
+        order_id = str(e.get("orderId") or "")
+        if order_id and order_id in cancelled_ids:
             continue
         orders += 1
         amount = _strict_amount(e.get("actualSaved", e.get("saved")))
@@ -152,6 +187,7 @@ def aggregate(period: str = "month", now: datetime | None = None) -> dict:
         "drops": drops,
         "orders": orders,
         "unverifiedOrders": unverified_orders,
+        "cancelledOrders": len(cancelled_ids),
         "stores": len(by_store),
         "items": items,
         "byStore": [{"storeCode": k, "price": v} for k, v in
